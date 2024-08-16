@@ -149,6 +149,6 @@ ul li.checked::before {
 }
 
 /* bootstrap color input height is 20px, with margins, only see 1px high border, override*/
-input[type='color'] {
+/* input[type='color'] {
     height: 30px;
-}
+} */

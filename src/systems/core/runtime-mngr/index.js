@@ -129,10 +129,6 @@ export default class RuntimeMngr {
             nameSpace: nameSpace,
             sceneName: sceneName,
         });
-        console.info('runtimeTopicPub:', this.runtimeTopicPub);
-        console.info('runtimeTopicSub:', this.runtimeTopicSub);
-        console.info('modulesTopicPub:', this.modulesTopicPub);
-        console.info('modulesTopicSub:', this.modulesTopicSub);
         this.regTimeoutSeconds = regTimeoutSeconds;
         this.onInitCallback = onInitCallback;
         this.fsLocation = fsLocation;

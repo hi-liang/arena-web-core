@@ -14,8 +14,15 @@
  *
  * Original console is saved to window.jsConsole
  */
+
+import { TOPICS } from '../constants';
+
 export default class ARENAMqttConsole {
-    static dftDbgTopic = 'realm/proc/debug/stdout/unknown-rtuuid';
+    static dftDbgTopic = TOPICS.PUBLISH.SCENE_DEBUG.formatStr({
+        nameSpace: 'public',
+        sceneName: 'default',
+        idTag: 'unknown-idTag'
+    });
 
     /**
      * Returns a console object that replaces the original console (original console saved to **window.jsConsole**)

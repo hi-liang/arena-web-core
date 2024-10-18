@@ -60,7 +60,6 @@ const TOPICS = Object.freeze({
         DEVICE:                `${REALM}/d/{deviceName}/{idTag}`,
         RT_RUNTIME:            `${REALM}/g/{nameSpace}/p/{rtUuid}`,
         RT_MODULES:            `${REALM}/s/{nameSpace}/{sceneName}/p/{idTag}`,
-        PROC_DBG:              `${REALM}/proc/debug/{uuid}`,
         SCENE_PRESENCE:        `${REALM}/s/{nameSpace}/{sceneName}/x/{idTag}`,
         SCENE_PRESENCE_PRIVATE:`${REALM}/s/{nameSpace}/{sceneName}/x/{idTag}/{toUid}`,
         SCENE_CHAT:            `${REALM}/s/{nameSpace}/{sceneName}/c/{idTag}`,

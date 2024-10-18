@@ -361,21 +361,24 @@ export async function populateObjectList(scene, filter, objTypeFilter, focusObje
     }
     persist.addEditSection.style = 'display:block';
 
-    updateSubscribeTopic(scene);
+    updateProgramSubscribeTopic(scene);
 }
 
-export function updateSubscribeTopic(scene) {
+export function updateProgramSubscribeTopic(scene) {
     if (persist.currentScene === scene) return;
-    if (!persist.mqttConnected) persist.pendingSubscribeUpdate = (scene) => updateSubscribeTopic(scene);
+    if (!persist.mqttConnected) persist.pendingSubscribeUpdate = (scene) => updateProgramSubscribeTopic(scene);
 
-    if (persist.currentScene) persist.mc.unsubscribe(persist.currentScene);
+    if (persist.currentProgramTopic) persist.mc.unsubscribe(persist.currentProgramTopic);
     if (scene) {
+        // note: subscribe to scene topic (not just programs)
         const topic = TOPICS.SUBSCRIBE.SCENE_PUBLIC.formatStr({
             nameSpace: scene.split('/')[0],
             sceneName: scene.split('/')[1],
         });
         persist.mc.subscribe(topic);
+        console.info("Subscribed:", topic);
         persist.currentScene = scene;
+        persist.currentProgramTopic = topic;
         populateProgramInstanceList();
     }
 }
@@ -683,8 +686,8 @@ export async function addObject(obj, nameSpace, sceneName) {
     const persistAlert = obj.persist === false ? '<br/><strong>Object not persisted.</strong>' : '';
     const objJson = JSON.stringify(obj);
     const topic = TOPICS.PUBLISH.SCENE_OBJECTS.formatStr({
-        nameSpace,
-        sceneName,
+        nameSpace: nameSpace,
+        sceneName: sceneName,
         objectId: obj.object_id,
     });
     console.info(`Publish [ ${topic}]: ${objJson}`);
@@ -770,7 +773,11 @@ function onMqttConnectionLost() {
 }
 
 export function pubProgramMsg(action, obj) {
-    const programTopic = 'realm/proc/control';
+    const programTopic =  TOPICS.PUBLISH.RT_MODULES.formatStr({
+        nameSpace: persist.currentScene.split('/')[0],
+        sceneName: persist.currentScene.split('/')[1],
+        idTag: settings.mqttUsername
+    });
     const programObj = JSON.stringify({
         object_id: ([1e7] + -1e3 + -4e3 + -8e3 + -1e11).replace(/[018]/g, (c) =>
             (c ^ (crypto.getRandomValues(new Uint8Array(1))[0] & (15 >> (c / 4)))).toString(16)

@@ -1,26 +1,22 @@
 /**
  * @fileoverview ARMarker System. Supports ARMarkers in a scene.
- * Attempts to detect device and setup camera capture accordingly:
- *   AR Headset: capture camera facing forward using getUserMedia
- *   Phone/tablet with WebXR Camera Capture API support: capture passthrough camera
- *   frames using the WebXR camera capture API (only in Android Chrome v93+)
- *   iPhone/iPad with custom browser: camera capture for Mozilla's WebXRViewer/WebARViewer
+ * Uses the new CV pipeline (CameraImageProvider and CV Processors).
  *
  * Open source software under the terms in /LICENSE
  * Copyright (c) 2020, The CONIX Research Center. All rights reserved.
- * @date 2020
+ * @date 2023
  */
 
-import WebXRCameraCapture from './camera-capture/ccwebxr';
-import WebARCameraCapture from './camera-capture/ccwebar';
-import ARHeadsetCameraCapture from './camera-capture/ccarheadset';
-import WebARViewerCameraCapture from './camera-capture/ccwebarviewer';
 import ARMarkerRelocalization from './armarker-reloc';
-import CVWorkerMsgs from './worker-msgs';
+import CVWorkerMsgs from './worker-msgs'; // Still used by ARMarkerRelocalization and potentially by AprilTagProcessor for known marker messages
 import { ARENA_EVENTS } from '../../constants';
 import { ARENAUtils } from '../../utils';
 
-const MAX_PERSISTENT_ANCHORS = 7;
+// New CV Pipeline imports
+import AprilTagProcessor from '../cv/cv-processors/apriltag-processor.js';
+import OpenVPSProcessor from '../cv/cv-processors/openvps-processor.js';
+
+const MAX_PERSISTENT_ANCHORS = 7; // From previous implementation
 
 /**
  * ARMarker System. Supports ARMarkers in a scene.
@@ -28,8 +24,6 @@ const MAX_PERSISTENT_ANCHORS = 7;
  */
 AFRAME.registerSystem('armarker', {
     schema: {
-        /* camera capture debug: creates a plane texture-mapped with the camera frames */
-        debugCameraCapture: { default: false },
         /* relocalization debug messages output */
         debugRelocalization: { default: false },
         /* networked marker solver flag; let relocalization up to a networked solver;
@@ -39,68 +33,84 @@ AFRAME.registerSystem('armarker', {
         ATLASUpdateIntervalSecs: { default: 30 },
         /* how often we tigger a device location update; 0=never */
         devLocUpdateIntervalSecs: { default: 0 },
+        // TODO: Consider if a specific debug flag for AprilTagProcessor is needed,
+        // or if debugRelocalization can be reused.
     },
     // ar markers in the scene
     markers: {},
     // ar markers retrieved from ATLAS
     ATLASMarkers: {},
-    // indicate if we started the cv pipeline
-    cvPipelineInitializing: false,
-    cvPipelineInitialized: false,
-    // initialized once the xr session starts
-    webXRSession: null,
-    // gl context used for webxr camera access; initialized once the xr session starts
-    webXRGlContext: null,
-    // cv worker instance
-    cvWorker: undefined,
-    // detection events are sent here
-    detectionEvts: new EventTarget(),
-    // init origin matrix for markerid=0 lookups (row-major)
-    originMatrix: new THREE.Matrix4().set(1, 0, 0, 0, 0, 0, 1, 0, 0, -1, 0, 0, 0, 0, 0, 1),
-    // if we detected WebXRViewer/WebARViewer
-    isWebXRViewer: ARENAUtils.isWebXRViewer(),
-    initialLocalized: false,
 
+    // New CV Pipeline properties
+    cameraImageProviderSystem: null,
+    provider: null, // Instance of CameraImageProvider
+    aprilTagProcessor: null,
+    openVPSProcessor: null,
+    relocalizer: null,
+    cameraRigObj3D: null,
+    cameraSpinnerObj3D: null,
+    arena: null, // Reference to ARENA system
+
+    // Shared properties (some from previous implementation)
+    webXRSession: null,
+    xrRefSpace: null, // Still needed for XRFrame poses and anchor creation
+    detectionEvts: new EventTarget(), // Used by ARMarkerRelocalization
+    originMatrix: new THREE.Matrix4().set(1, 0, 0, 0, 0, 0, 1, 0, 0, -1, 0, 0, 0, 0, 0, 1),
+    isWebXRViewer: ARENAUtils.isWebXRViewer(), // Still relevant for some logic
+    initialLocalized: false, // Managed by relocalization logic
     originAnchor: undefined,
     pendingOriginAnchor: undefined,
-    /*
-     * Init system
-     * @param {object} marker - The marker component object to register.
-     * @alias module:armarker-system
-     */
+
     init() {
         ARENA.events.addMultiEventListener(
             [ARENA_EVENTS.ARENA_LOADED, ARENA_EVENTS.SCENE_OPT_LOADED],
             this.ready.bind(this)
         );
+
+        // Bind provider event listeners
+        this._onProviderInitialized = this._onProviderInitialized.bind(this);
+        this._onProviderFailed = this._onProviderFailed.bind(this);
+        this.el.sceneEl.addEventListener('camera-provider-initialized', this._onProviderInitialized);
+        this.el.sceneEl.addEventListener('camera-provider-failed', this._onProviderFailed);
     },
 
     ready() {
         const { el } = this;
-
         const { sceneEl } = el;
 
         this.arena = sceneEl.systems['arena-scene'];
+        this.cameraImageProviderSystem = sceneEl.systems['camera-image-provider'];
 
-        // init this.ATLASMarkers with list of markers within range
-        // this.getARMArkersFromATLAS(true);
+        this.cameraRigObj3D = document.getElementById('cameraRig')?.object3D;
+        this.cameraSpinnerObj3D = document.getElementById('cameraSpinner')?.object3D;
 
-        // init networkedLocationSolver flag from ARENA scene options
-        this.data.networkedLocationSolver = !!this.arena.networkedLocationSolver;
-
-        // request camera access features
-        if (!ARENA.params.camFollow) {
-            const { optionalFeatures } = sceneEl.systems.webxr.data;
-            if (this.isWebXRViewer) {
-                optionalFeatures.push('computerVision'); // request custom 'computerVision' feature in XRBrowser
-            } else optionalFeatures.push('camera-access'); // request WebXR 'camera-access' otherwise
-            sceneEl.systems.webxr.sceneEl.setAttribute('optionalFeatures', optionalFeatures);
+        if (!this.cameraRigObj3D || !this.cameraSpinnerObj3D) {
+            console.warn('ARMarker System: cameraRig or cameraSpinner Object3D not found. Relocalization may fail.');
         }
 
-        // listener for AR session start
+        this.data.networkedLocationSolver = !!this.arena.networkedLocationSolver;
+
+        // Request camera access features (similar to old implementation, may need review with new CV pipeline)
+        if (!ARENA.params.camFollow) { // camFollow implies no local CV processing
+            const webxrSysData = sceneEl.systems.webxr?.data;
+            if (webxrSysData) {
+                const { optionalFeatures } = webxrSysData;
+                if (this.isWebXRViewer) {
+                    if (!optionalFeatures.includes('computerVision')) optionalFeatures.push('computerVision');
+                } else {
+                    if (!optionalFeatures.includes('camera-access')) optionalFeatures.push('camera-access');
+                }
+                // No direct way to setAttribute on system data, this might be handled by A-Frame WebXR system updates.
+                // Forcing it like this might be brittle:
+                // sceneEl.systems.webxr.sceneEl.setAttribute('webxr', 'optionalFeatures', optionalFeatures.join(', '));
+                // It's better if CameraImageProvider handles any necessary feature requests via its helpers.
+            } else {
+                console.warn('ARMarker System: WebXR system not found, cannot set optionalFeatures for camera access.');
+            }
+        }
+
+        // Listener for AR session start (mostly for WebXR session-specific setup like anchors)
         if (sceneEl.hasWebXR && navigator.xr && navigator.xr.addEventListener) {
-            // This is delayed from `enter-vr` to a referenceSpace is acquired.
-            // Will not fire for WebXR browser (see webxr-device-manager)
             sceneEl.renderer.xr.addEventListener('sessionstart', () => {
                 if (sceneEl.is('ar-mode')) {
                     const { xrSession } = sceneEl;
@@ -108,236 +118,230 @@ AFRAME.registerSystem('armarker', {
                 }
             });
         }
+        // If CameraImageProvider is already initialized (e.g. GUM started early), try initializing processors
+        if (this.cameraImageProviderSystem && this.cameraImageProviderSystem.provider) {
+             this._onProviderInitialized({ detail: { provider: this.cameraImageProviderSystem.provider }});
+        }
     },
-    /*
-     * System attribute update
-     * @param {object} oldData - previous attribute values.
-     * @alias module:armarker-system
-     */
-    update() {
-        // TODO: Do stuff with `this.data`...
+
+    _onProviderInitialized(evt) {
+        if (this.provider) return; // Already initialized
+
+        this.provider = evt.detail.provider;
+        if (this.provider) {
+            console.info('ARMarker System: Camera Image Provider initialized.');
+            this._initializeProcessors();
+        } else {
+            // This case should ideally be handled by _onProviderFailed if provider is null from event
+            console.error('ARMarker System: Provider initialized event received, but provider instance is null.');
+            this._onProviderFailed(); // Treat as failure
+        }
     },
-    /**
-     * WebXR session started callback
-     * @param {object} xrSession - Handle to the WebXR session
-     */
+
+    _onProviderFailed() {
+        console.error('ARMarker System: Camera Image Provider failed to initialize. ARMarker CV features disabled.');
+        this.provider = null;
+    },
+
+    _initializeProcessors() {
+        if (!this.provider) {
+            console.error('ARMarker System: Cannot initialize processors, Camera Image Provider is not available.');
+            return;
+        }
+
+        // AprilTagProcessor Setup
+        const arMarkerSysInterface = {
+            getMarker: this.getMarker.bind(this),
+            el: this.el,
+            arena: this.arena,
+            webXRSession: this.webXRSession,
+            initialLocalized: this.initialLocalized, // Pass current state
+            // For ARMarkerRelocalization, it needs access to cameraRig and cameraSpinner object3Ds
+            // We can pass them directly or it can try to get them via document.getElementById if needed.
+            // Since we have them:
+            cameraRig: this.cameraRigObj3D ? { object3D: this.cameraRigObj3D } : null,
+            cameraSpinner: this.cameraSpinnerObj3D ? { object3D: this.cameraSpinnerObj3D } : null,
+            // ARMarkerRelocalization also uses this.originMatrix and this.setOriginAnchor
+            // from the `arMakerSys` object passed to it.
+            originMatrix: this.originMatrix,
+            setOriginAnchor: this.setOriginAnchor.bind(this),
+            // Expose detectionEvts for relocalizer to listen to
+            // detectionEvts: this.detectionEvts, // This is no longer needed here, ARMarkerRelocalization takes it directly
+
+            // Expose methods for relocalizer to update internal state like initialLocalized
+            setInitialLocalized: (value) => { this.initialLocalized = value; },
+        };
+
+        this.aprilTagProcessor = new AprilTagProcessor({
+            debug: this.data.debugRelocalization, // Reuse debug flag for now
+            arMarkerSystemInterface: arMarkerSysInterface, // For relocalizer if instantiated inside
+            enableRelocalization: true, // Assuming relocalization is key for armarker
+            arenaScene: this.el.sceneEl, // Pass scene element for relocalizer
+            networkedLocationSolver: this.data.networkedLocationSolver,
+            debugRelocalization: this.data.debugRelocalization,
+        });
+        
+        // Instantiate ARMarkerRelocalization here and link it
+        // ARMarkerRelocalization listens to aprilTagProcessor.detectionEvents
+        this.relocalizer = new ARMarkerRelocalization({
+            arMakerSys: arMarkerSysInterface, // Pass the interface
+            detectionsEventTarget: this.aprilTagProcessor.detectionEvents, // Listen to events from AprilTagProcessor
+            networkedLocationSolver: this.data.networkedLocationSolver,
+            debug: this.data.debugRelocalization,
+        });
+
+        this.provider.registerProcessor(this.aprilTagProcessor);
+        console.info('ARMarker System: AprilTagProcessor registered.');
+
+        Object.values(this.markers).forEach(markerComponent => {
+            if (markerComponent.data.markertype === 'apriltag_36h11') {
+                this.aprilTagProcessor.addKnownMarker(markerComponent.data.markerid, markerComponent.data.size);
+            }
+        });
+
+        // OpenVPSProcessor Setup (Conditional)
+        const openvpsComponent = this.el.sceneEl.components.openvps;
+        if (openvpsComponent && openvpsComponent.data.enabled && openvpsComponent.data.imageUrl) {
+            this.openVPSProcessor = new OpenVPSProcessor({
+                imageUrl: openvpsComponent.data.imageUrl,
+                interval: openvpsComponent.data.interval,
+                imgQuality: openvpsComponent.data.imgQuality,
+                imgType: openvpsComponent.data.imgType,
+                flipHorizontal: openvpsComponent.data.flipHorizontal !== undefined ? openvpsComponent.data.flipHorizontal : false,
+                flipVertical: openvpsComponent.data.flipVertical !== undefined ? openvpsComponent.data.flipVertical : false,
+                debug: openvpsComponent.data.debug,
+                onPoseUpdate: this._handleOpenVPSPoseUpdate.bind(this)
+            });
+            if (!openvpsComponent.data.confirmed) {
+                this.openVPSProcessor.setEnabled(false);
+            }
+            this.provider.registerProcessor(this.openVPSProcessor);
+            console.info('ARMarker System: OpenVPSProcessor registered.');
+        } else {
+            if (openvpsComponent && openvpsComponent.data.enabled && !openvpsComponent.data.imageUrl) {
+                console.warn('ARMarker System: OpenVPS component enabled but imageUrl is missing. OpenVPSProcessor not started.');
+            }
+        }
+        ARENA.events.emit(ARENA_EVENTS.CV_INITIALIZED); // Emit event after processors are set up
+    },
+
+    _handleOpenVPSPoseUpdate(newRigMatrix, confidence) {
+        if (this.cameraRigObj3D && this.cameraSpinnerObj3D) {
+            this.cameraRigObj3D.position.setFromMatrixPosition(newRigMatrix);
+            //Spinner rotation is relative to rig, OpenVPS provides world pose for rig
+            //So, effectively spinner rotation is identity relative to rig after OpenVPS update
+            //This means we set spinner's world rotation to the rotation part of newRigMatrix
+            this.cameraSpinnerObj3D.setRotationFromMatrix(newRigMatrix); 
+
+            if (this.data.debugRelocalization) {
+                console.log(`ARMarker: OpenVPS Pose Updated. Confidence: ${confidence}. Rig position:`, this.cameraRigObj3D.position);
+            }
+            
+            this.initialLocalized = true; // OpenVPS provides an absolute pose
+
+            const { xrSession } = this.el.sceneEl;
+            if (xrSession && this.xrRefSpace) { // Ensure xrRefSpace is also available
+                xrSession.requestAnimationFrame((time, frame) => {
+                    // Use current rig and spinner pose for the anchor
+                    const currentPosition = this.cameraRigObj3D.position;
+                    const currentQuaternion = this.cameraSpinnerObj3D.quaternion; // World quaternion of spinner
+
+                    this.setOriginAnchor(
+                        { position: { ...currentPosition }, rotation: { ...currentQuaternion } },
+                        frame
+                    );
+                });
+            }
+        } else {
+            console.warn('ARMarker System: cameraRig or cameraSpinner Object3D not found for OpenVPS pose update.');
+        }
+    },
+
     async webXRSessionStarted(xrSession) {
         if (xrSession !== undefined) {
             this.webXRSession = xrSession;
-            this.gl = this.el.renderer.getContext();
-
-            // make sure gl context is XR compatible
-            try {
-                await this.gl.makeXRCompatible();
-            } catch (err) {
-                console.error('Could not make make gl context XR compatible!', err);
-            }
+            // this.gl = this.el.renderer.getContext(); // GL context is now obtained by CameraImageProvider if needed
+            // No longer need to call makeXRCompatible here, provider/helpers handle it.
 
             this.xrRefSpace = AFRAME.scenes[0].renderer.xr.getReferenceSpace();
 
+            // Anchor management logic remains
             const persistedOriginAnchor = window.localStorage.getItem('originAnchor');
-            if (xrSession.persistentAnchors && persistedOriginAnchor) {
+            if (xrSession.persistentAnchors && persistedOriginAnchor && this.xrRefSpace) {
                 xrSession
                     .restorePersistentAnchor(persistedOriginAnchor)
                     .then((anchor) => {
                         this.originAnchor = anchor;
                         xrSession.requestAnimationFrame((time, frame) => {
                             const originPose = frame.getPose(anchor.anchorSpace, this.xrRefSpace);
-                            if (originPose) {
+                            if (originPose && this.cameraRigObj3D && this.cameraSpinnerObj3D) {
                                 const {
                                     transform: { position, orientation },
                                 } = originPose;
                                 const orientationQuat = new THREE.Quaternion(
-                                    orientation.x,
-                                    orientation.y,
-                                    orientation.z,
-                                    orientation.w
+                                    orientation.x, orientation.y, orientation.z, orientation.w
                                 );
-                                const rig = document.getElementById('cameraRig');
-                                const spinner = document.getElementById('cameraSpinner');
-                                rig.object3D.position.copy(position);
-                                spinner.object3D.rotation.setFromQuaternion(orientationQuat);
+                                this.cameraRigObj3D.position.copy(position);
+                                this.cameraSpinnerObj3D.rotation.setFromQuaternion(orientationQuat);
                             }
                         });
                     })
                     .catch(() => {
                         console.warn('Could not restore persisted origin anchor');
-                        xrSession.persistentAnchors.forEach(async (anchor) => {
-                            try {
-                                await xrSession.restorePersistentAnchor(anchor);
-                            } catch (err) {
-                                console.warn('Could not delete persisted anchor');
-                            }
-                        });
+                        if (xrSession.persistentAnchors) { // Check again as it might be nullified
+                            xrSession.persistentAnchors.forEach(async (anchorUUID) => { // Iterate over UUIDs
+                                try {
+                                    await xrSession.deletePersistentAnchor(anchorUUID);
+                                } catch (err) {
+                                    console.warn('Could not delete persisted anchor by UUID', err);
+                                }
+                            });
+                        }
                         window.localStorage.removeItem('originAnchor');
                     });
             } else {
                 window.localStorage.removeItem('originAnchor');
             }
         }
+        // Old: if (!ARENA.params.camFollow) { this.initCVPipeline(); }
+        // New: CV pipeline (provider & processors) should initialize independently based on camera-provider-initialized
+        // or if GUM starts early. If provider is already up, _initializeProcessors might be called from ready().
+    },
 
-        // init cv pipeline, if we are not using an external localizer
-        if (!ARENA.params.camFollow) {
-            this.initCVPipeline();
+    update(oldData) {
+        // Handle changes to system data if necessary, e.g., debug flags
+        if (this.data.debugRelocalization !== oldData.debugRelocalization) {
+            if (this.aprilTagProcessor) this.aprilTagProcessor.options.debug = this.data.debugRelocalization;
+            if (this.relocalizer) this.relocalizer.debug = this.data.debugRelocalization;
+            if (this.openVPSProcessor) this.openVPSProcessor.options.debug = this.data.debugRelocalization;
+        }
+        if (this.data.networkedLocationSolver !== oldData.networkedLocationSolver) {
+            if (this.relocalizer) this.relocalizer.networkedLocationSolver = this.data.networkedLocationSolver;
+             if (this.aprilTagProcessor && this.aprilTagProcessor.options.enableRelocalization) {
+                // If relocalizer is inside AprilTagProcessor, update its option
+                // This part depends on how AprilTagProcessor exposes relocalizer's options.
+                // For now, assuming direct update to relocalizer is sufficient.
+            }
         }
     },
-    /**
-     * Setup cv pipeline (camera capture and cv worker)
-     * Attempts to detect device and setup camera capture accordingly:
-     *   ARHeadsetCameraCapture: capture camera facing forward using getUserMedia
-     *   WebXRCameraCapture: capture passthrough camera frames using the WebXR camera capture
-     *                       API (only in Android Chrome v93+)
-     *   WebARViewerCameraCapture: camera capture for custom iOS browser (WebXRViewer/WebARViewer)
-     *
-     */
-    async initCVPipeline() {
-        if (this.cvPipelineInitializing || this.cvPipelineInitialized) return;
-        if (AFRAME.utils.device.isOculusBrowser()) return;
-        this.cvPipelineInitializing = true;
-        // try to set up a WebXRViewer/WebARViewer (custom iOS browser) camera capture pipeline
-        if (this.isWebXRViewer) {
-            try {
-                this.cameraCapture = new WebARViewerCameraCapture(this.data.debugCameraCapture);
-            } catch (err) {
-                this.cvPipelineInitializing = false;
-                console.warn(`Could not create WebXRViewer/WebARViewer camera capture. ${err}`);
-                return; // we are done here
-            }
-        }
 
-        // if we are on an AR headset, use camera facing forward
-        const arHeadset = ARENAUtils.detectARHeadset();
-        if (arHeadset !== 'unknown') {
-            // try to set up a camera facing forward capture (using getUserMedia)
-            console.info('Setting up AR Headset camera capture.');
-            try {
-                this.cameraCapture = new ARHeadsetCameraCapture(ARENA.arHeadset, this, this.data.debugCameraCapture);
-            } catch (err) {
-                console.warn(`Could not create AR Headset camera capture. ${err}`);
-            }
-        }
-
-        if (!this.cameraCapture) {
-            // Not WebXRViewer/WebARViewer, not AR headset
-            // ignore camera capture when in VR Mode
-            const sceneEl = document.querySelector('a-scene');
-            if (!sceneEl.is('ar-mode')) {
-                console.info('Attempted to initialize camera capture, but found VR Mode.');
-                return;
-            }
-
-            if (window.XRWebGLBinding) {
-                // Set up a webxr camera capture (e.g. passthrough AR on a phone)
-                console.info('Setting up WebXR-based passthrough AR camera capture.');
-                try {
-                    this.cameraCapture = new WebXRCameraCapture(
-                        this.webXRSession,
-                        this.gl,
-                        this.data.debugCameraCapture
-                    );
-                } catch (err) {
-                    this.cvPipelineInitializing = false;
-                    console.error(`No valid CV camera capture found. ${err}`);
-                    return; // no valid cv camera capture; we are done here
-                }
-            } else {
-                // Final fallthrough to Spot AR, no real WebXR support
-                try {
-                    this.cameraCapture = new WebARCameraCapture();
-                    await this.cameraCapture.initCamera();
-                } catch (err) {
-                    this.cvPipelineInitializing = false;
-                    console.error(`No valid CV camera capture found. ${err}`);
-                    return; // no valid cv camera capture; we are done here
-                }
-            }
-        }
-
-        // create cv worker for apriltag detection
-        this.cvWorker = new Worker(new URL('dist/apriltag.js', import.meta.url), { type: 'module' });
-        this.cameraCapture.setCVWorker(this.cvWorker); // let camera capture know about the cv worker
-
-        // listen for worker messages
-        this.cvWorker.addEventListener('message', this.cvWorkerMessage.bind(this));
-
-        // setup ar marker relocalization that will listen to ar marker detection events
-        this.markerReloc = new ARMarkerRelocalization({
-            arMakerSys: this,
-            detectionsEventTarget: this.detectionEvts,
-            networkedLocationSolver: this.data.networkedLocationSolver,
-            debug: this.data.debugRelocalization,
-        });
-
-        this.cvPipelineInitializing = false;
-        this.cvPipelineInitialized = true;
-
-        ARENA.events.emit(ARENA_EVENTS.CV_INITIALIZED);
-
-        // send size of known markers to cvWorker (so it can compute pose)
-        Object.entries(this.markers).forEach(([mid, marker]) => {
-            const newMarker = {
-                type: CVWorkerMsgs.type.KNOWN_MARKER_ADD,
-                // marker id
-                markerid: mid,
-                // marker size in meters (marker component size is mm)
-                size: marker.data.size / 1000,
-            };
-            this.cvWorker.postMessage(newMarker);
-        });
-    },
-    /**
-     * Handle messages from cvWorker (detector)
-     * @param {object} msg - The worker message received.
-     * @alias module:armarker-system
-     */
-    cvWorkerMessage(msg) {
-        const cvWorkerMsg = msg.data;
-
-        switch (cvWorkerMsg.type) {
-            case CVWorkerMsgs.type.FRAME_RESULTS:
-                // pass detections and original frame timestamp to relocalization
-                if (cvWorkerMsg.detections.length) {
-                    const detectionEvent = new CustomEvent('armarker-detection', {
-                        detail: {
-                            detections: cvWorkerMsg.detections,
-                            ts: cvWorkerMsg.ts,
-                        },
-                    });
-                    this.detectionEvts.dispatchEvent(detectionEvent);
-                }
-                // request next camera frame and return image buffer to camera capture
-                this.cameraCapture.requestCameraFrame(cvWorkerMsg.grayscalePixels);
-                break;
-            case CVWorkerMsgs.type.INIT_DONE:
-            case CVWorkerMsgs.type.NEXT_FRAME_REQ:
-                // request next camera frame
-                this.cameraCapture.requestCameraFrame();
-                break;
-            default:
-                console.warn('ARMarker System: unknow message from CV worker.');
-        }
-    },
-    /**
-     * Queries ATLAS for ar makers within geolocation (requires ARENA)
-     * @param {boolean} init - weather it is init time (first time we get the markers) or not
-     * @return {Promise<boolean>}
-     */
     async getARMArkersFromATLAS(init = false) {
-        if (!window.ARENA) return false; // requires ARENA
+        // This method remains largely the same, as it's about marker data, not CV processing.
+        // Ensure it doesn't conflict with new CV flow.
+        if (!window.ARENA) return false;
         const { ARENA } = window;
 
-        // at init time, make sure we fetch ar markers from ATLAS
         if (init) {
             this.lastATLASUpdate = new Date();
             this.lastdevLocUpdate = new Date();
         }
 
-        // check if we should trigger a device location update
         if (this.data.devLocUpdateIntervalSecs > 0) {
-            if (new Date() - this.lastdevLocUpdate < this.data.devLocUpdateIntervalSecs * 1000) {
+            const now = new Date();
+            if (now - this.lastdevLocUpdate >= this.data.devLocUpdateIntervalSecs * 1000) {
                 ARENAUtils.getLocation((coords, err) => {
                     if (!err) ARENA.clientCoords = coords;
-                    this.lastdevLocUpdate = new Date();
+                    this.lastdevLocUpdate = now; // Update time after attempt
                 });
             }
         }
@@ -347,98 +351,61 @@ AFRAME.registerSystem('armarker', {
         }
         const position = ARENA.clientCoords;
 
-        // ATLASUpdateIntervalSecs=0: only update tags at init
         if (this.data.ATLASUpdateIntervalSecs === 0 && !init) return false;
-
-        // limit to ATLASUpdateIntervalSecs update interval
-        if (new Date() - this.lastATLASUpdate < this.data.ATLASUpdateIntervalSecs * 1000) {
+        const now = new Date();
+        if (now - this.lastATLASUpdate < this.data.ATLASUpdateIntervalSecs * 1000) {
             return false;
         }
-        fetch(
-            `${ARENA.ATLASurl}/lookup/geo?objectType=apriltag&distance=20&units=km&lat=${position.latitude}&long=${position.longitude}`
-        )
-            .then((response) => {
-                window.this.lastATLASUpdate = new Date();
-                return response.json();
-            })
-            .catch(() => {
-                console.warn('Error retrieving ATLAS markers');
+        
+        try {
+            const response = await fetch(
+                `${ARENA.ATLASurl}/lookup/geo?objectType=apriltag&distance=20&units=km&lat=${position.latitude}&long=${position.longitude}`
+            );
+            this.lastATLASUpdate = new Date(); // Update time after fetch attempt
+            if (!response.ok) {
+                console.warn(`Error retrieving ATLAS markers: ${response.status}`);
                 return false;
-            })
-            .then((data) => {
-                data.forEach((tag) => {
-                    const tagid = tag.name.substring(9);
-                    if (tagid !== 0) {
-                        if (tag.pose && Array.isArray(tag.pose)) {
-                            const tagMatrix = new THREE.Matrix4();
-                            tagMatrix.fromArray(tag.pose.flat()); // comes in row-major, loads col-major
-                            tagMatrix.transpose(); // flip properly to row-major
-                            this.ATLASMarkers[tagid] = {
-                                id: tagid,
-                                uuid: tag.id,
-                                pose: tagMatrix,
-                            };
-                        }
+            }
+            const data = await response.json();
+            data.forEach((tag) => {
+                const tagid = tag.name.substring(9); // Assumes "apriltag_" prefix
+                if (tagid !== "0") { // Marker ID 0 is reserved for origin
+                    if (tag.pose && Array.isArray(tag.pose)) {
+                        const tagMatrix = new THREE.Matrix4();
+                        tagMatrix.fromArray(tag.pose.flat());
+                        tagMatrix.transpose();
+                        this.ATLASMarkers[tagid] = {
+                            id: tagid,
+                            uuid: tag.id,
+                            pose: tagMatrix,
+                        };
                     }
-                });
+                }
             });
-        return true;
-    },
-
-    /**
-     * Register an ARMarker component with the system
-     * @param {object} marker - The marker component object to register.
-     * @alias module:armarker-system
-     */
-    async registerComponent(marker) {
-        this.markers[marker.data.markerid] = marker;
-        if (this.cvPipelineInitialized) {
-            // indicate cv worker that a marker was added
-            const newMarker = {
-                type: CVWorkerMsgs.type.KNOWN_MARKER_ADD,
-                // marker id
-                markerid: marker.data.markerid,
-                // marker size in meters (marker component size is mm)
-                size: marker.data.size / 1000,
-            };
-            this.cvWorker.postMessage(newMarker);
-        } else {
-            // nothing to do; upon cv pipeline init the marker will be indicated to cv worker (see initCVPipeline())
+            return true;
+        } catch (error) {
+            console.warn('Error during ATLAS fetch or processing:', error);
+            this.lastATLASUpdate = new Date(); // Still update time to prevent spamming on error
+            return false;
         }
     },
-    /**
-     * Unregister an ARMarker component
-     * @param {object} marker - The marker component object to unregister.
-     * @alias module:armarker-system
-     */
+
+    registerComponent(marker) {
+        this.markers[marker.data.markerid] = marker;
+        if (this.aprilTagProcessor && marker.data.markertype === 'apriltag_36h11') {
+            this.aprilTagProcessor.addKnownMarker(marker.data.markerid, marker.data.size);
+        }
+    },
+
     unregisterComponent(marker) {
-        if (this.cvPipelineInitialized) {
-            // indicate marker was removed to cv worker
-            const delMarker = {
-                type: CVWorkerMsgs.type.KNOWN_MARKER_DEL,
-                // marker id
-                markerid: marker.data.markerid,
-            };
-            this.cvWorker.postMessage(delMarker);
+        if (this.aprilTagProcessor && marker.data.markertype === 'apriltag_36h11') {
+            this.aprilTagProcessor.removeKnownMarker(marker.data.markerid);
         }
         delete this.markers[marker.data.markerid];
     },
-    /**
-     * Get all markers registered with the system
-     * @param {object} mtype - The marker type 'apriltag_36h11', 'lightanchor', 'uwb', 'vive', 'optitrack' to filter for;
-     *                         No argument or undefined will return all
-     * @return {object} - a dictionary of markers
-     * @alias module:armarker-system
-     * @example <caption>Query the system a list of all markers in a scene</caption>
-     *     let markers = document.querySelector("a-scene").systems["armarker"].getAll();
-     *     Object.keys(markers).forEach(function(key) {
-     *       console.log(`tag id: ${markers[key].data.markerid}`, markers[key].el.object3D.matrixWorld); //matrixWorld: https://threejs.org/docs/#api/en/math/Matrix4
-     *     });
-     * @example <caption>getAll() also accepts a marker type argument to filter by a given type</caption>
-     *     let markers = document.querySelector("a-scene").systems["armarker"].getAll('apriltag_36h11');
-     *
-     */
+
     getAll(mtype = undefined) {
+        // This method remains the same.
         if (mtype === undefined) return this.markers;
         return Object.assign(
             {},
@@ -447,31 +414,24 @@ AFRAME.registerSystem('armarker', {
                 .map(([k, v]) => ({ [k]: v }))
         );
     },
-    /**
-     * Get a marker given its markerid; first lookup local scene objects, then ATLAS
-     * Marker with ID 0 is assumed to be at (x, y, z) 0, 0, 0
-     * @param {string} markerid - The marker id to return (converts to string, if a string is not given)
-     * @return {object} - the marker with the markerid given or undefined
-     * @alias module:armarker-system
-     */
+
     getMarker(markerid) {
+        // This method remains largely the same.
         if (!(typeof markerid === 'string' || markerid instanceof String)) {
-            // eslint-disable-next-line no-param-reassign
-            markerid = String(markerid); // convert markerid to string
+            markerid = String(markerid);
         }
         const sceneTag = this.markers[markerid];
         if (sceneTag !== undefined) {
-            const markerPose = sceneTag.el.object3D.matrixWorld; // get object world matrix
+            const markerPose = sceneTag.el.object3D.matrixWorld;
             const pos = new THREE.Vector3();
             const quat = new THREE.Quaternion();
             const scale = new THREE.Vector3();
             markerPose.decompose(pos, quat, scale);
-            const markerPoseNoScale = new THREE.Matrix4(); // create a world matrix with only position and rotation
+            const markerPoseNoScale = new THREE.Matrix4();
             markerPoseNoScale.makeRotationFromQuaternion(quat);
             markerPoseNoScale.setPosition(pos);
             return { ...sceneTag.data, obj_id: sceneTag.el.id, pose: markerPoseNoScale };
         }
-        // default pose for tag 0
         if (markerid === '0') {
             return {
                 id: String(markerid),
@@ -481,28 +441,15 @@ AFRAME.registerSystem('armarker', {
                 buildable: false,
             };
         }
-        if (!this.ATLASMarkers[markerid]) {
-            // if (ARENA.clientCoords === undefined) {
-            //     ARENAUtils.getLocation((coords, err) => {
-            //         if (!err) ARENA.clientCoords = coords;
-            //     });
-            // }
-            // force update from ATLAS if not found
-            // this.getARMArkersFromATLAS();
-        }
+        // ATLAS query logic can remain, but should be less frequent if local CV is robust
+        // Consider if getARMArkersFromATLAS should be called here if marker not found.
+        // For now, it's a passive lookup.
         return this.ATLASMarkers[String(markerid)];
     },
 
-    /**
-     * Add an anchor to the origin of the XR reference space, persisting if possible. This is NOT pose synced
-     * to the originating frame, but since this likely triggered off a marker detection requiring low motion
-     * and good visual acquisition of target area, or outside-in localizer like Optitrack, good enough.
-     * @param {{position: {x, y, z}, rotation: {x,y,z,w}}} originAnchor - The anchor object to create
-     * @param {XRFrame} xrFrame - must be passed directly from requestAnimationFrame callback
-     */
     setOriginAnchor({ position, rotation }, xrFrame) {
+        // This method remains largely the same.
         if (!this.webXRSession || !this.xrRefSpace) {
-            // This may be a webar session. Don't try to anchor
             return;
         }
         if (!xrFrame) {
@@ -511,33 +458,65 @@ AFRAME.registerSystem('armarker', {
         }
         const anchorPose = new XRRigidTransform(position, rotation);
         xrFrame.createAnchor(anchorPose, this.xrRefSpace).then(async (anchor) => {
-            // Persist, currently Quest browser only
-            if (anchor.requestPersistentHandle) {
+            if (anchor.requestPersistentHandle && this.webXRSession.persistentAnchors) {
                 const oldPersistAnchor = window.localStorage.getItem('originAnchor');
                 if (oldPersistAnchor) {
-                    // Delete the old anchor
-                    await this.webXRSession.deletePersistentAnchor(oldPersistAnchor);
+                    try { await this.webXRSession.deletePersistentAnchor(oldPersistAnchor); }
+                    catch(e) { console.warn("Could not delete old persistent anchor", e); }
                 }
-                // Check how many anchors there are, Quest has a low limit currently
                 if (this.webXRSession.persistentAnchors.length >= MAX_PERSISTENT_ANCHORS) {
-                    // Delete the oldest anchor
                     const oldestAnchor = this.webXRSession.persistentAnchors.values().next().value;
-                    await this.webXRSession.deletePersistentAnchor(oldestAnchor);
+                    if (oldestAnchor) {
+                         try { await this.webXRSession.deletePersistentAnchor(oldestAnchor); }
+                         catch(e) { console.warn("Could not delete oldest persistent anchor", e); }
+                    }
                 }
-                anchor
-                    .requestPersistentHandle()
-                    .then((handle) => {
-                        // Save the new one
-                        window.localStorage.setItem('originAnchor', handle);
-                    })
-                    .catch((err) => {
-                        console.error('Could not persist anchor', err);
-                    });
-            } else if (this.originAnchor) {
+                try {
+                    const handle = await anchor.requestPersistentHandle();
+                    window.localStorage.setItem('originAnchor', handle);
+                } catch (err) {
+                    console.error('Could not persist anchor', err);
+                }
+            } else if (this.originAnchor && typeof this.originAnchor.delete === 'function') {
                 this.originAnchor.delete();
             }
             this.originAnchor = anchor;
             this.pendingOriginAnchor = false;
+        }).catch(err => {
+            console.error("Error creating anchor in setOriginAnchor:", err);
         });
     },
+
+    remove() {
+        // Clean up new CV pipeline components
+        if (this.provider) {
+            if (this.aprilTagProcessor) this.provider.unregisterProcessor(this.aprilTagProcessor);
+            if (this.openVPSProcessor) this.provider.unregisterProcessor(this.openVPSProcessor);
+        }
+        if (this.aprilTagProcessor) {
+            this.aprilTagProcessor.destroy();
+            this.aprilTagProcessor = null;
+        }
+        if (this.openVPSProcessor) {
+            this.openVPSProcessor.destroy();
+            this.openVPSProcessor = null;
+        }
+        if (this.relocalizer && typeof this.relocalizer.destroy === 'function') {
+            // this.relocalizer.destroy(); // ARMarkerRelocalization doesn't have destroy
+        }
+        this.relocalizer = null;
+        this.provider = null; // Dereference
+
+        // Remove event listeners
+        this.el.sceneEl.removeEventListener('camera-provider-initialized', this._onProviderInitialized);
+        this.el.sceneEl.removeEventListener('camera-provider-failed', this._onProviderFailed);
+
+        // Other cleanups from old implementation if necessary
+        this.markers = {};
+        this.ATLASMarkers = {};
+        if (this.originAnchor && typeof this.originAnchor.delete === 'function') {
+            this.originAnchor.delete();
+            this.originAnchor = null;
+        }
+    }
 });

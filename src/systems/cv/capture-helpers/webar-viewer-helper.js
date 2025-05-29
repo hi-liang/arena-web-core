@@ -13,34 +13,31 @@
 //   - `grayscalePixels` is the Uint8Array containing the Y-plane data.
 //   - `camera` contains intrinsics (fx, fy, cx, cy, gamma=0) derived from `frame._camera.cameraIntrinsics`.
 //
-// New API (based on task description for WebARViewerCaptureHelper):
-// - xrSession.getComputerVisionData() -> returns object with { width, height, buffer, textureY, textureCbCr, displayTexture, cameraViewMatrix, timestamp }
-// - xrSession.getCameraIntrinsics() -> returns object with { fx, fy, cx, cy, projectionMatrix }
+// WebARViewer new API (from previous tasks, not the one used here):
+// - xrSession.getComputerVisionData()
+// - xrSession.getCameraIntrinsics()
+// This helper will now primarily use the global window.processCV (legacy/original WebARViewer API)
 
 import BaseCaptureHelper from './base-capture-helper.js';
 const THREE = AFRAME.THREE;
 
 export default class WebARViewerCaptureHelper extends BaseCaptureHelper {
-    constructor(xrSession, aframeCameraEl = null, options = {}) {
+    constructor(xrSession, aframeCameraEl = null, options = {}, providerInterface = null) {
         super(xrSession, null, aframeCameraEl, options); 
+        this.providerInterface = providerInterface;
 
-        // this.isCapturing = false; // Managed by BaseCaptureHelper
         this.gl = null; 
         this.frameWidth = 0;
         this.frameHeight = 0;
         this.rgbaBuffer = null; 
-
-        this.yTexture = null;
-        this.cbcrTexture = null;
-        this.displayTexture = null; 
-
-        this.cvData = null; 
         this.fb = null; 
+        this.cachedCameraIntrinsics = null; // To store intrinsics from xrSession or cvFrame
 
         // Reusable THREE.Matrix4 instances
         this.reusableWorldPose = new THREE.Matrix4();
         this.reusableViewTransformMatrix = new THREE.Matrix4();
-        // projectionMatrix is typically Float32Array from API, not reused as THREE.Matrix4 here
+
+        this._handleProcessCV = this._handleProcessCV.bind(this);
 
         this.debug = this.options.debug || false;
         if (this.debug) {
@@ -49,53 +46,109 @@ export default class WebARViewerCaptureHelper extends BaseCaptureHelper {
     }
 
     static isSupported(xrSession) {
-        return !!(
-            xrSession &&
-            typeof xrSession.getComputerVisionData === 'function' &&
-            typeof xrSession.getCameraIntrinsics === 'function'
-        );
+        // Check for the global processCV function and the newer WebXRViewer API
+        // but prioritize window.processCV if available for this helper's path.
+        const globalProcessCVExists = typeof window.processCV === 'function';
+        const webkitHandlerExists = (typeof window.webkit !== 'undefined' && 
+                                    typeof window.webkit.messageHandlers !== 'undefined' && 
+                                    typeof window.webkit.messageHandlers.WebXRViewer !== 'undefined');
+        
+        // If xrSession is provided, also check for its specific methods as a fallback/alternative.
+        const xrSessionAPIsExist = !!(xrSession &&
+                                    typeof xrSession.getCameraIntrinsics === 'function' &&
+                                    (typeof xrSession.getComputerVisionData === 'function' || globalProcessCVExists || webkitHandlerExists));
+        
+        // This helper, as refactored, will rely on window.processCV.
+        // isSupported should reflect the primary mechanism it will use.
+        return globalProcessCVExists || webkitHandlerExists || xrSessionAPIsExist;
     }
 
     async init() {
-        if (this.isCapturing) { // isCapturing is from BaseCaptureHelper
+        if (this.isCapturing) { 
             if (this.debug) console.log('WebARViewerCaptureHelper: Already initialized.');
             return true;
         }
-        if (!this.xrSession) {
-            console.error('WebARViewerCaptureHelper: xrSession not provided for init.');
+        // xrSession is not strictly required if window.processCV is the sole mechanism.
+        // However, if using xrSession.getCameraIntrinsics, it's needed.
+        if (!WebARViewerCaptureHelper.isSupported(this.xrSession)) { // Pass xrSession for comprehensive check
+            console.error('WebARViewerCaptureHelper: Required API (window.processCV or xrSession methods) not detected.');
             return false;
         }
 
-        if (!WebARViewerCaptureHelper.isSupported(this.xrSession)) {
-            console.error('WebARViewerCaptureHelper: xrSession does not support required computer vision APIs.');
-            return false;
-        }
-
-        this.gl = this.xrSession.glContext || this.options.glContext || null;
-        if (!this.gl && this.debug) {
-            console.warn('WebARViewerCaptureHelper: No WebGL context available. displayTexture readback will not be possible.');
-        }
-
-        try {
-            const initialIntrinsics = this.xrSession.getCameraIntrinsics();
-            if (!initialIntrinsics || !initialIntrinsics.projectionMatrix) {
-                console.error('WebARViewerCaptureHelper: Failed to get valid initial camera intrinsics.');
-                return false;
+        // If xrSession is available and has getCameraIntrinsics, cache them.
+        // This is a bit of a hybrid approach: use window.processCV for frame data,
+        // but xrSession.getCameraIntrinsics if available.
+        if (this.xrSession && typeof this.xrSession.getCameraIntrinsics === 'function') {
+            try {
+                this.cachedCameraIntrinsics = this.xrSession.getCameraIntrinsics();
+                if (!this.cachedCameraIntrinsics && this.debug) {
+                     console.warn('WebARViewerCaptureHelper: Could not cache initial camera intrinsics from xrSession.');
+                } else if (this.debug) {
+                    console.log('WebARViewerCaptureHelper: Cached camera intrinsics from xrSession.');
+                }
+            } catch (error) {
+                 if (this.debug) console.warn('WebARViewerCaptureHelper: Error caching intrinsics from xrSession:', error);
             }
-            if (this.debug) console.log('WebARViewerCaptureHelper: Initial camera intrinsics obtained.');
-        } catch (error) {
-            console.error('WebARViewerCaptureHelper: Error during init while checking camera intrinsics:', error);
-            return false;
+        }
+        
+        // GL context might be needed for displayTexture conversion if that path is used
+        // inside _handleProcessCV.
+        if (this.xrSession && this.xrSession.glContext) {
+            this.gl = this.xrSession.glContext;
+        } else if (this.options.glContext) {
+            this.gl = this.options.glContext;
+        }
+        if (!this.gl && this.debug) {
+            console.warn('WebARViewerCaptureHelper: No WebGL context. displayTexture conversion might fail if needed.');
         }
 
-        this.isCapturing = true; // Mark as initialized
-        // super.startStreaming(); // Streaming starts when CameraImageProvider calls startStreaming
-        // BaseCaptureHelper.isStreaming will be used to gate getFrameData
-
-        if (this.debug) console.log('WebARViewerCaptureHelper: Initialized successfully.');
+        this.isCapturing = true; 
+        if (this.debug) console.log('WebARViewerCaptureHelper: Initialized successfully. Ready for window.processCV.');
         return true;
     }
+    
+    // Helper for WebGL texture to RGBA (assumes previous implementation or similar)
+    async convertToRGBAFromDisplayTexture(displayTexture, targetRgbaBuffer) {
+        if (!this.gl || !displayTexture) return false;
+        if (!this.fb) this.fb = this.gl.createFramebuffer();
+        
+        const previousFramebuffer = this.gl.getParameter(this.gl.FRAMEBUFFER_BINDING);
+        this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, this.fb);
+        this.gl.framebufferTexture2D(this.gl.FRAMEBUFFER, this.gl.COLOR_ATTACHMENT0, this.gl.TEXTURE_2D, displayTexture, 0);
+        
+        const status = this.gl.checkFramebufferStatus(this.gl.FRAMEBUFFER);
+        let success = false;
+        if (status === this.gl.FRAMEBUFFER_COMPLETE) {
+            this.gl.readPixels(0, 0, this.frameWidth, this.frameHeight, this.gl.RGBA, this.gl.UNSIGNED_BYTE, targetRgbaBuffer);
+            success = true;
+        } else {
+            console.error('WebARViewerCaptureHelper: Framebuffer not complete for displayTexture. Status:', status);
+        }
+        this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, previousFramebuffer);
+        return success;
+    }
 
+    // Helper for software buffer to RGBA (assumes previous implementation or similar)
+    // This is a simplified placeholder. The actual _softwareNV21toRGBA is more complex.
+    _softwareBufferToRGBA(buffer, targetRgbaBuffer, width, height) {
+        // Assuming buffer is NV21, use the existing _softwareNV21toRGBA
+        // The cvFrame might have a 'format' property.
+        // For now, directly calling the NV21 one if format implies it.
+        // The cvFrame object passed to _handleProcessCV should have a format field.
+        // This is a simplified call; actual logic might need to check cvFrame.format.
+        if (buffer && buffer.byteLength >= width * height * 1.5) { // Basic check for NV21 size
+             const yPlaneSize = width * height;
+             const yBuffer = new Uint8Array(buffer, 0, yPlaneSize);
+             const vuBuffer = new Uint8Array(buffer, yPlaneSize);
+             this._softwareNV21toRGBA(yBuffer, vuBuffer, width, height, targetRgbaBuffer);
+             return true;
+        }
+        console.warn("WebARViewerCaptureHelper: Software buffer conversion failed or format not supported.");
+        return false;
+    }
+
+
+    // Copied from previous implementation to be self-contained here
     _softwareNV21toRGBA(yBuffer, vuBuffer, width, height, targetRgbaBuffer) {
         const yPlaneSize = width * height;
         if (yBuffer.byteLength < yPlaneSize || vuBuffer.byteLength < yPlaneSize / 2) {
@@ -120,114 +173,82 @@ export default class WebARViewerCaptureHelper extends BaseCaptureHelper {
         }
     }
 
-    async getFrameData(time, frame = null, pose = null) { 
-        if (!this.isCapturing || !super.isStreaming || !this.xrSession) {
-            if (this.debug && (!this.isCapturing || !super.isStreaming)) {
-                 // console.warn('WebARViewerCaptureHelper: Not capturing or streaming.');
-            }
-            return null;
+
+    async _handleProcessCV(cvFrame) {
+        if (!this.isCapturing || !super.isStreaming || !cvFrame) { // Check super.isStreaming
+            return;
+        }
+ 
+        // If intrinsics not cached via xrSession.getCameraIntrinsics() during init,
+        // try to get them from the cvFrame itself (original WebARViewer behavior).
+        if (!this.cachedCameraIntrinsics && cvFrame._camera && cvFrame._camera.cameraIntrinsics) {
+            const ci = cvFrame._camera.cameraIntrinsics;
+            this.cachedCameraIntrinsics = {
+                fx: ci[0], fy: ci[4], cx: ci[6], cy: ci[7], gamma: 0,
+                projectionMatrix: cvFrame._camera.projectionMatrix, // Assuming this is also provided
+            };
+            if (this.options.debug) console.log('WebARViewerCaptureHelper: Cached camera intrinsics from cvFrame.');
+        } else if (!this.cachedCameraIntrinsics && this.xrSession && typeof this.xrSession.getCameraIntrinsics === 'function'){
+            // Fallback to try getting from xrSession again if not available from cvFrame._camera
+             try {
+                this.cachedCameraIntrinsics = this.xrSession.getCameraIntrinsics();
+             } catch (e) { /* ignore */ }
         }
 
-        try {
-            this.cvData = this.xrSession.getComputerVisionData();
-        } catch (error) {
-            console.error('WebARViewerCaptureHelper: Error calling getComputerVisionData():', error);
-            return null;
+
+        if (!this.cachedCameraIntrinsics || !this.cachedCameraIntrinsics.projectionMatrix) {
+             if (this.options.debug) console.warn('WebARViewerCaptureHelper: Missing camera intrinsics or projection matrix.');
+             return;
         }
-
-        if (!this.cvData) {
-            if (this.debug) console.warn('WebARViewerCaptureHelper: getComputerVisionData() returned null.');
-            return null;
+ 
+        // Extract data from cvFrame, which matches the new API structure for its fields
+        // This means window.processCV is now expected to pass a frame in the new format.
+        // If it's the old format (base64 buffers), this part needs significant adaptation.
+        // Assuming cvFrame structure is: { width, height, buffer, textureY, textureCbCr, displayTexture, cameraViewMatrix, timestamp, _camera (for old intrinsics) }
+        
+        const { width, height, buffer, textureY, textureCbCr, displayTexture, cameraViewMatrix, timestamp } = cvFrame;
+        this.frameWidth = width; 
+        this.frameHeight = height;
+ 
+        const currentBufferSize = this.frameWidth * this.frameHeight * 4;
+        if (!this.rgbaBuffer || this.rgbaBuffer.length !== currentBufferSize) {
+            this.rgbaBuffer = new Uint8ClampedArray(currentBufferSize);
         }
+ 
+        let conversionSuccess = false;
+        let originalFormat = 'WebARViewer_Unknown';
 
-        let cameraIntrinsicsObj;
-        try {
-            cameraIntrinsicsObj = this.xrSession.getCameraIntrinsics();
-        } catch (error) {
-            console.error('WebARViewerCaptureHelper: Error calling getCameraIntrinsics():', error);
-            return null;
+        if (displayTexture && this.gl) {
+            conversionSuccess = await this.convertToRGBAFromDisplayTexture(displayTexture, this.rgbaBuffer);
+            if (conversionSuccess) originalFormat = 'WebARViewer_DisplayTexture';
         }
-
-        if (!cameraIntrinsicsObj || !cameraIntrinsicsObj.projectionMatrix || !this.cvData.cameraViewMatrix) {
-            console.error('WebARViewerCaptureHelper: Missing camera intrinsics or view matrix.');
-            return null;
+        
+        // The cvFrame.buffer here is assumed to be in a format like NV21 if not displayTexture
+        if (!conversionSuccess && buffer) { 
+            // Assuming buffer is NV21 or similar. cvFrame should ideally have a 'format' field.
+            // Let's assume _softwareBufferToRGBA checks format or defaults to NV21.
+            conversionSuccess = this._softwareBufferToRGBA(buffer, this.rgbaBuffer, this.frameWidth, this.frameHeight);
+            if (conversionSuccess) originalFormat = 'WebARViewer_Buffer_NV21'; // Be more specific if possible
         }
-
-        this.frameWidth = this.cvData.width || 0;
-        this.frameHeight = this.cvData.height || 0;
-
-        if (this.frameWidth === 0 || this.frameHeight === 0) {
-            console.warn('WebARViewerCaptureHelper: Frame dimensions are zero.');
-            return null;
+        
+        if (!conversionSuccess) {
+            if (this.options.debug) console.warn('WebARViewerCaptureHelper: Failed to convert image to RGBA.');
+            return;
         }
-
-        const requiredRgbaBufferSize = this.frameWidth * this.frameHeight * 4;
-        if (!this.rgbaBuffer || this.rgbaBuffer.byteLength !== requiredRgbaBufferSize) {
-            this.rgbaBuffer = new Uint8ClampedArray(requiredRgbaBufferSize);
-            if (this.debug) console.log(`WebARViewerCaptureHelper: RGBA buffer resized to ${this.frameWidth}x${this.frameHeight}`);
-        }
-
-        let originalFormat = 'WebARViewerFormat_Unknown';
-
-        if (this.cvData.displayTexture && this.gl) {
-            if (!this.fb) this.fb = this.gl.createFramebuffer();
-            const previousFramebuffer = this.gl.getParameter(this.gl.FRAMEBUFFER_BINDING);
-            this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, this.fb);
-            this.gl.framebufferTexture2D(this.gl.FRAMEBUFFER, this.gl.COLOR_ATTACHMENT0, this.gl.TEXTURE_2D, this.cvData.displayTexture, 0);
-            const status = this.gl.checkFramebufferStatus(this.gl.FRAMEBUFFER);
-            if (status === this.gl.FRAMEBUFFER_COMPLETE) {
-                this.gl.readPixels(0, 0, this.frameWidth, this.frameHeight, this.gl.RGBA, this.gl.UNSIGNED_BYTE, this.rgbaBuffer);
-                originalFormat = 'YCbCr_via_displayTexture_to_RGBA';
-                 if (this.debug) console.log('WebARViewerCaptureHelper: Read RGBA from displayTexture.');
-            } else {
-                console.error('WebARViewerCaptureHelper: Framebuffer not complete for displayTexture. Status:', status);
-                 this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, previousFramebuffer); 
-            }
-            this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, previousFramebuffer); 
-        } else if (this.cvData.textureY && this.cvData.textureCbCr && this.gl) {
-            console.warn('WebARViewerCaptureHelper: YCbCr WebGL textures provided, but GPU conversion shader is not implemented. Returning no image data.');
-            originalFormat = 'YCbCr_WebGLTextures_Raw';
-            return null; 
-        } else if (this.cvData.buffer) {
-            if (this.cvData.format === 'NV21' || (!this.cvData.format && this.debug)) { 
-                 if (this.debug && !this.cvData.format) console.warn("WebARViewerCaptureHelper: cvData.format is missing, assuming NV21 for buffer conversion.");
-                const yPlaneSize = this.frameWidth * this.frameHeight;
-                if (this.cvData.buffer.byteLength >= yPlaneSize + yPlaneSize / 2) {
-                    const yBuffer = new Uint8Array(this.cvData.buffer, 0, yPlaneSize);
-                    const vuBuffer = new Uint8Array(this.cvData.buffer, yPlaneSize);
-                    this._softwareNV21toRGBA(yBuffer, vuBuffer, this.frameWidth, this.frameHeight, this.rgbaBuffer);
-                    originalFormat = 'NV21_Buffer_to_RGBA_Software';
-                    if (this.debug) console.log('WebARViewerCaptureHelper: Converted NV21 buffer to RGBA via software.');
-                } else {
-                     console.error('WebARViewerCaptureHelper: NV21 buffer size is incorrect.');
-                     return null;
-                }
-            } else {
-                console.warn(`WebARViewerCaptureHelper: Buffer provided with format ${this.cvData.format || 'unknown'}. Software conversion for this format is not implemented.`);
-                originalFormat = `Buffer_${this.cvData.format || 'unknown'}_Raw`;
-                return null; 
-            }
-        } else {
-            console.warn('WebARViewerCaptureHelper: No usable image data (displayTexture, YCbCr textures, or buffer) found in cvData.');
-            return null;
-        }
-
-        // Use reusable matrices
-        this.reusableViewTransformMatrix.fromArray(this.cvData.cameraViewMatrix);
-        this.reusableWorldPose.copy(this.reusableViewTransformMatrix).invert(); 
-        // projectionMatrix is Float32Array from API, so no THREE.Matrix4 reuse for it.
-        const projMArray = new Float32Array(cameraIntrinsicsObj.projectionMatrix);
-
-
+ 
+        this.reusableViewTransformMatrix.fromArray(cameraViewMatrix);
+        this.reusableWorldPose.copy(this.reusableViewTransformMatrix).invert();
+        
+        const projM = new Float32Array(this.cachedCameraIntrinsics.projectionMatrix); 
         const intrinsics = {
-            fx: cameraIntrinsicsObj.fx,
-            fy: cameraIntrinsicsObj.fy,
-            cx: cameraIntrinsicsObj.cx,
-            cy: cameraIntrinsicsObj.cy,
-            gamma: cameraIntrinsicsObj.gamma || 0, 
+            fx: this.cachedCameraIntrinsics.fx,
+            fy: this.cachedCameraIntrinsics.fy,
+            cx: this.cachedCameraIntrinsics.cx,
+            cy: this.cachedCameraIntrinsics.cy,
+            gamma: this.cachedCameraIntrinsics.gamma || 0,
         };
-
-        return {
+ 
+        const frameData = {
             imageData: {
                 buffer: this.rgbaBuffer,
                 width: this.frameWidth,
@@ -236,39 +257,76 @@ export default class WebARViewerCaptureHelper extends BaseCaptureHelper {
                 originalFormat: originalFormat,
             },
             metadata: {
-                timestamp: this.cvData.timestamp || time,
-                worldPose: this.reusableWorldPose, 
+                timestamp: timestamp || performance.now(), 
+                worldPose: this.reusableWorldPose,
                 cameraIntrinsics: intrinsics,
-                projectionMatrix: projMArray, 
-                viewTransformMatrix: this.reusableViewTransformMatrix, 
-            },
+                projectionMatrix: projM,
+                viewTransformMatrix: this.reusableViewTransformMatrix
+            }
         };
+ 
+        if (this.providerInterface && typeof this.providerInterface.distributeFrameData === 'function') {
+            this.providerInterface.distributeFrameData(frameData);
+        }
     }
+
+    startStreaming() { 
+        super.startStreaming(); // Sets this.isStreaming = true
+        if (this.isCapturing && WebARViewerCaptureHelper.isSupported(this.xrSession)) { // Check isSupported again
+            if (typeof window.processCV !== 'undefined' && this.options.debug && window.processCV !== this._handleProcessCV) {
+                console.warn('WebARViewerCaptureHelper: window.processCV is already defined by another handler. Overwriting.');
+            }
+            window.processCV = this._handleProcessCV;
+            
+            if (this.xrSession && typeof this.xrSession.initComputerVision === 'function') {
+                try {
+                    this.xrSession.initComputerVision();
+                } catch (e) {
+                    if (this.options.debug) console.warn("Error calling xrSession.initComputerVision():", e);
+                }
+            }
+            if (this.options.debug) console.log('WebARViewerCaptureHelper: window.processCV set and streaming started.');
+        } else if (this.options.debug) {
+            console.warn('WebARViewerCaptureHelper: Could not start streaming for window.processCV. Conditions not met.');
+        }
+    }
+
+    stopStreaming() { 
+        super.stopStreaming(); // Sets this.isStreaming = false
+        if (window.processCV === this._handleProcessCV) {
+            window.processCV = undefined; // Or restore previous if saved
+            if (this.options.debug) console.log('WebARViewerCaptureHelper: window.processCV cleared.');
+        }
+        if (this.xrSession && typeof this.xrSession.stopComputerVision === 'function') {
+            try {
+                this.xrSession.stopComputerVision();
+            } catch (e) {
+                if (this.options.debug) console.warn("Error calling xrSession.stopComputerVision():", e);
+            }
+        }
+    }
+    
+    // getFrameData is removed as per instructions.
+    // async getFrameData(time, frame = null, pose = null) { return null; }
+
 
     destroy() {
         if (this.debug) console.log('WebARViewerCaptureHelper: Destroying...');
-        // this.isCapturing = false; // Managed by BaseCaptureHelper.destroy()
-        super.stopStreaming(); 
+        this.stopStreaming(); // Ensure window.processCV is cleared
 
         if (this.gl && this.fb) {
-            try {
-                this.gl.deleteFramebuffer(this.fb);
-            } catch (e) {
-                console.error('WebARViewerCaptureHelper: Error deleting framebuffer:', e);
-            }
+            try { this.gl.deleteFramebuffer(this.fb); } 
+            catch (e) { console.error('WebARViewerCaptureHelper: Error deleting framebuffer:', e); }
         }
         this.fb = null;
         this.rgbaBuffer = null;
-        this.yTexture = null;
-        this.cbcrTexture = null;
-        this.displayTexture = null;
-        this.cvData = null;
-
-        super.destroy(); // Calls BaseCaptureHelper's destroy for common cleanup
+        this.cachedCameraIntrinsics = null;
+        
+        super.destroy(); 
 
         if (this.debug) console.log('WebARViewerCaptureHelper: Destroyed.');
     }
 }
 
-WebARViewerCaptureHelper.prototype.usesXRFrame = true;
-// WebARViewerCaptureHelper.isSupported = WebARViewerCaptureHelper.isSupported; // Not needed static inherited.
+WebARViewerCaptureHelper.prototype.usesXRFrame = false; // Data is pushed via window.processCV
+// WebARViewerCaptureHelper.isSupported = WebARViewerCaptureHelper.isSupported; // Static methods inherit.

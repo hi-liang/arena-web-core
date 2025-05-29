@@ -18,7 +18,7 @@ const THREE = AFRAME.THREE;
 export default class WebXRRawCameraCaptureHelper extends BaseCaptureHelper {
     constructor(xrSession, glContext, xrRefSpace, aframeCameraEl = null, options = {}) {
         super(xrSession, glContext, aframeCameraEl, options); 
-        this.xrRefSpace = xrRefSpace; 
+        this.xrRefSpace = xrRefSpace; // Storing xrRefSpace passed from CameraImageProvider
 
         this.glBinding = null;
         this.fb = null; 
@@ -30,11 +30,11 @@ export default class WebXRRawCameraCaptureHelper extends BaseCaptureHelper {
 
         // Reusable THREE.Matrix4 instances
         this.reusableWorldPose = new THREE.Matrix4();
-        this.reusableViewTransformMatrix = new THREE.Matrix4();
-        this.reusableViewerMatrix = new THREE.Matrix4(); // For intermediate calculation
+        this.reusableViewTransformMatrix = new THREE.Matrix4(); // Will store view.transform.matrix
+        this.reusableViewerMatrix = new THREE.Matrix4(); // Will store viewerPose.transform.matrix
 
 
-        this.debug = options.debug || false;
+        this.debug = options.debug || false; // Ensure options.debug is accessed via this.options if preferred after super
         if (this.debug) {
             console.info('WebXRRawCameraCaptureHelper: Debug mode enabled.');
         }
@@ -54,9 +54,8 @@ export default class WebXRRawCameraCaptureHelper extends BaseCaptureHelper {
     }
 
     async init() {
-        // isCapturing is set to false in BaseCaptureHelper constructor
         if (this.isCapturing) { 
-             if (this.options.debug) console.log('WebXRRawCameraCaptureHelper: Already initialized.');
+             if (this.debug) console.log('WebXRRawCameraCaptureHelper: Already initialized.');
              return true;
         }
 
@@ -83,15 +82,16 @@ export default class WebXRRawCameraCaptureHelper extends BaseCaptureHelper {
             return false;
         }
 
-        if (!this.xrRefSpace) {
-            console.error('WebXRRawCameraCaptureHelper: XR reference space not provided or available at init.');
+        if (!this.xrRefSpace) { // This check is now more critical if pose is fetched here
+            console.error('WebXRRawCameraCaptureHelper: XR reference space not provided during construction or available at init.');
              if (this.fb) this.gl.deleteFramebuffer(this.fb);
-             if (this.glBinding) this.glBinding = null; // Should not happen if fb creation failed
+             // this.glBinding should be nulled if we are returning false from init and it was created
+             if (this.glBinding) this.glBinding = null; 
              this.fb = null;
             return false;
         }
 
-        this.isCapturing = true; // Mark as initialized
+        this.isCapturing = true; 
         if (this.debug) console.log('WebXRRawCameraCaptureHelper: Initialized successfully.');
         return true;
     }
@@ -117,22 +117,35 @@ export default class WebXRRawCameraCaptureHelper extends BaseCaptureHelper {
             console.error('WebXRRawCameraCaptureHelper: NaN value in calculated camera intrinsics.');
             return null;
         }
-
         return { fx, fy, cx, cy, gamma };
     }
 
-    async getFrameData(time, frame, pose) {
+    // Signature changed: pose parameter removed
+    async getFrameData(time, frame) { 
         // isStreaming is set by BaseCaptureHelper's start/stopStreaming
-        if (!this.isCapturing || !super.isStreaming || !this.glBinding || !frame || !pose || !this.xrRefSpace || !this.fb) {
+        if (!this.isCapturing || !super.isStreaming || !this.glBinding || !frame || !this.fb) {
             if (this.debug && (!this.isCapturing || !super.isStreaming)) {
                 // console.warn('WebXRRawCameraCaptureHelper: Not capturing/streaming or not properly initialized.');
             }
             return null;
         }
 
+        if (!this.xrRefSpace) { // Moved from init to here as per instructions, though also checked in init.
+            console.error('WebXRRawCameraCaptureHelper: xrRefSpace is not available.');
+            return null;
+        }
+        const viewerPose = frame.getViewerPose(this.xrRefSpace);
+        if (!viewerPose) {
+            if (this.options && this.options.debug) { 
+                console.warn('WebXRRawCameraCaptureHelper: No viewer pose for XR frame.');
+            }
+            return null;
+        }
+
         let processedViewData = null;
 
-        for (const view of pose.views) {
+        // Loop changed from pose.views to viewerPose.views
+        for (const view of viewerPose.views) {
             if (!view.camera) continue;
 
             const xrCamera = view.camera;
@@ -197,18 +210,18 @@ export default class WebXRRawCameraCaptureHelper extends BaseCaptureHelper {
             this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, previousFramebuffer); 
             this.gl.deleteTexture(texture); 
 
-            this.reusableViewerMatrix.fromArray(pose.transform.matrix);
-            this.reusableViewTransformMatrix.fromArray(view.transform.matrix); // This is view-relative-to-viewer
+            // Use viewerPose and view.transform.matrix
+            this.reusableViewerMatrix.fromArray(viewerPose.transform.matrix);
+            this.reusableViewTransformMatrix.fromArray(view.transform.matrix); // This is view-relative-to-viewer (viewMatrixInViewerSpace)
             this.reusableWorldPose.multiplyMatrices(this.reusableViewerMatrix, this.reusableViewTransformMatrix);
 
 
-            // Fallback logic for problematic matrices (from previous implementation)
+            // Fallback logic for problematic matrices
             if (!this.reusableWorldPose.elements.some(e => !isNaN(e) && Math.abs(e) > 1e-6) && 
                 this.aframeCameraEl && this.aframeCameraEl.object3D) {
                  console.warn("WebXRRawCameraCaptureHelper: viewWorldMatrix from XRFrame invalid, falling back to aframeCameraEl.object3D.matrixWorld");
                  this.reusableWorldPose.copy(this.aframeCameraEl.object3D.matrixWorld);
-                 // If worldPose is a fallback, viewTransformMatrix needs to be consistent (inverse of world)
-                 this.reusableViewTransformMatrix.copy(this.reusableWorldPose).invert();
+                 this.reusableViewTransformMatrix.copy(this.reusableWorldPose).invert(); // viewTransformMatrix becomes effectively inverse of worldPose
             }
 
 
@@ -225,7 +238,7 @@ export default class WebXRRawCameraCaptureHelper extends BaseCaptureHelper {
                     worldPose: this.reusableWorldPose, 
                     cameraIntrinsics: this.frameCameraIntrinsics,
                     projectionMatrix: new Float32Array(view.projectionMatrix), 
-                    viewTransformMatrix: this.reusableViewTransformMatrix, 
+                    viewTransformMatrix: this.reusableViewTransformMatrix, // This holds view.transform.matrix (relative to viewer)
                 },
             };
             break; 
@@ -234,12 +247,8 @@ export default class WebXRRawCameraCaptureHelper extends BaseCaptureHelper {
         return processedViewData; 
     }
 
-    // startStreaming and stopStreaming are inherited from BaseCaptureHelper
-    // and manage this.isStreaming
-
     destroy() {
         if (this.debug) console.log('WebXRRawCameraCaptureHelper: Destroying...');
-        // this.isCapturing is managed by BaseCaptureHelper.destroy()
         if (this.gl && this.fb) {
             try {
                 this.gl.deleteFramebuffer(this.fb);
@@ -252,11 +261,11 @@ export default class WebXRRawCameraCaptureHelper extends BaseCaptureHelper {
         this.framePixels = null;
         this.frameCameraIntrinsics = null;
         
-        super.destroy(); // Calls BaseCaptureHelper's destroy for common cleanup
+        super.destroy(); 
 
         if (this.debug) console.log('WebXRRawCameraCaptureHelper: Destroyed.');
     }
 }
 
 WebXRRawCameraCaptureHelper.prototype.usesXRFrame = true;
-// WebXRRawCameraCaptureHelper.isSupported = WebXRRawCameraCaptureHelper.isSupported; // Not needed static inherited
+// WebXRRawCameraCaptureHelper.isSupported = WebXRRawCameraCaptureHelper.isSupported; // Not needed, static methods inherit.

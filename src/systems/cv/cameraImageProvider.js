@@ -20,7 +20,7 @@ export default class CameraImageProvider {
     constructor(xrSession, glContext, xrRefSpace, aframeCameraEl, options = {}) {
         this.xrSession = xrSession;
         this.gl = glContext;
-        this.xrRefSpace = xrRefSpace; // Correctly assigned
+        this.xrRefSpace = xrRefSpace; 
         this.aframeCameraEl = aframeCameraEl;
 
         if (!this.aframeCameraEl && options.debug) {
@@ -38,21 +38,13 @@ export default class CameraImageProvider {
         this.isPipelineBusy = false;
 
         this._onXRFrame = this._onXRFrame.bind(this);
-        this._onGUMFrame = this._onGUMFrame.bind(this);
+        this.distributeFrameData = this.distributeFrameData.bind(this); // Bind new method
 
-        // gl.makeXRCompatible() might be needed for WebXR Raw Camera helper
-        // It's called here to ensure it's done before helper.init() which might use gl context.
-        if (this.gl && this.xrSession) { // Only relevant if an XR session might use WebGL
+        if (this.gl && this.xrSession) { 
             this.gl.makeXRCompatible().catch((err) => {
                 console.error('CameraImageProvider: Could not make gl context XR compatible!', err);
-                // This error might prevent WebXRRawCameraCaptureHelper from initializing successfully.
-                // The helper's init method should handle this gracefully.
             });
         }
-
-        // Attempt to detect and initialize the camera API asynchronously.
-        // The actual start of capture will be triggered by processor registration
-        // or if a GUM helper initializes and processors are already present.
         this._detectAndInitializeApi();
     }
 
@@ -69,36 +61,34 @@ export default class CameraImageProvider {
             debug: this.options.debug,
             glContext: this.gl,
             aframeCameraEl: this.aframeCameraEl,
-            // xrRefSpace is passed directly to WebXRRawCameraCaptureHelper constructor where needed
+        };
+        
+        const providerInterface = {
+            distributeFrameData: this.distributeFrameData,
         };
 
-        // 1. WebARViewer (custom iOS browser like WebXRViewer/WebARViewer)
-        //    Uses new xrSession.getComputerVisionData() API
         if (this.xrSession && WebARViewerCaptureHelper.isSupported(this.xrSession)) {
             if (this.options.debug) console.log('CameraImageProvider: Trying WebARViewerCaptureHelper...');
-            const helper = new WebARViewerCaptureHelper(this.xrSession, this.aframeCameraEl, helperOptions);
-            if (await helper.init()) { // init is async
+            // Pass providerInterface to WebARViewerCaptureHelper
+            const helper = new WebARViewerCaptureHelper(this.xrSession, this.aframeCameraEl, helperOptions, providerInterface);
+            if (await helper.init()) { 
                 this.activeApiName = 'webar-viewer';
                 this.captureHelper = helper;
                 console.info(`CameraImageProvider: Initialized ${this.activeApiName}.`);
-                // If processors are already registered, start the loop
                 if (this.processors.size > 0 && !this.isCapturing) this._startCaptureLoop();
                 return;
             }
             if (this.options.debug) console.log('CameraImageProvider: WebARViewerCaptureHelper init failed.');
         }
 
-
-        // 2. WebXR Raw Camera Access API
         if (this.xrSession && this.gl && !this.captureHelper) {
             if (this.options.debug) console.log('CameraImageProvider: Trying WebXRRawCameraCaptureHelper...');
             if (WebXRRawCameraCaptureHelper.isSupported(this.xrSession, this.gl)) {
-                // xrRefSpace is crucial for WebXR Raw Camera
                 if (!this.xrRefSpace) {
                      console.warn('CameraImageProvider: xrRefSpace not available, cannot initialize WebXRRawCameraCaptureHelper.');
                 } else {
                     const helper = new WebXRRawCameraCaptureHelper(this.xrSession, this.gl, this.xrRefSpace, this.aframeCameraEl, helperOptions);
-                    if (await helper.init()) { // init is async
+                    if (await helper.init()) { 
                         this.activeApiName = 'webxr-raw-camera';
                         this.captureHelper = helper;
                         console.info(`CameraImageProvider: Initialized ${this.activeApiName}.`);
@@ -112,21 +102,21 @@ export default class CameraImageProvider {
             }
         }
 
-        // 3. AR Headset (using getUserMedia)
         const detectedHeadset = ARENAUtils.detectARHeadset();
         if (detectedHeadset !== 'unknown' && !this.captureHelper) {
             if (this.options.debug) console.log(`CameraImageProvider: Detected AR Headset (${detectedHeadset}). Trying GetUserMediaCaptureHelper (headset mode)...`);
             if (GetUserMediaCaptureHelper.isSupported()) {
-                const headsetOptions = { ...helperOptions, isHeadset: true, requestedWidth: 640, requestedHeight: 480 /* Example defaults */ };
-                const helper = new GetUserMediaCaptureHelper(this.aframeCameraEl, headsetOptions);
+                const headsetOptions = { ...helperOptions, isHeadset: true, requestedWidth: 640, requestedHeight: 480 };
+                // Pass providerInterface to GetUserMediaCaptureHelper
+                const helper = new GetUserMediaCaptureHelper(this.aframeCameraEl, headsetOptions, providerInterface);
                 try {
-                    const success = await helper.init(); // GUM init is async
-                    if (success && !this.captureHelper) { // Check captureHelper again in async callback
+                    const success = await helper.init(); 
+                    if (success && !this.captureHelper) { 
                         this.activeApiName = 'ar-headset-gum';
                         this.captureHelper = helper;
                         console.info(`CameraImageProvider: Initialized ${this.activeApiName}.`);
                         if (this.processors.size > 0 && !this.isCapturing) this._startCaptureLoop();
-                        return; // Successfully initialized headset GUM
+                        return; 
                     }
                     if (!success && this.options.debug) console.log('CameraImageProvider: AR Headset GUM helper failed to init, will try fallback GUM.');
                 } catch (error) {
@@ -137,13 +127,11 @@ export default class CameraImageProvider {
             }
         }
 
-        // 4. Fallback to generic getUserMedia (WebAR)
         if (!this.captureHelper) {
             if (this.options.debug) console.log('CameraImageProvider: No specific helper succeeded or matched, trying Fallback GUM...');
-            await this._tryFallbackGum(helperOptions); // Ensure this is awaited or handled if it sets state
+            await this._tryFallbackGum(helperOptions, providerInterface); 
         }
 
-        // Final check after all attempts
         if (!this.captureHelper) {
             this._handleApiInitializationError('No suitable camera API could be initialized after all checks.');
         } else {
@@ -151,16 +139,17 @@ export default class CameraImageProvider {
         }
     }
 
-    async _tryFallbackGum(helperOptions) {
-        if (this.captureHelper) return; // Already initialized
+    async _tryFallbackGum(helperOptions, providerInterface) { // Added providerInterface parameter
+        if (this.captureHelper) return; 
 
         if (this.options.debug) console.log('CameraImageProvider: Trying Fallback GUM...');
         if (GetUserMediaCaptureHelper.isSupported()) {
             const gumOptions = { ...helperOptions, isHeadset: false, requestedWidth: 640, requestedHeight: 480 };
-            const helper = new GetUserMediaCaptureHelper(this.aframeCameraEl, gumOptions);
+            // Pass providerInterface to GetUserMediaCaptureHelper
+            const helper = new GetUserMediaCaptureHelper(this.aframeCameraEl, gumOptions, providerInterface);
             try {
                 const success = await helper.init();
-                if (success && !this.captureHelper) { // Check captureHelper again
+                if (success && !this.captureHelper) { 
                     this.activeApiName = 'webar-gum';
                     this.captureHelper = helper;
                     console.info(`CameraImageProvider: Initialized ${this.activeApiName} (fallback).`);
@@ -180,13 +169,10 @@ export default class CameraImageProvider {
         }
     }
 
-
     _handleApiInitializationError(message, errorObj = null) {
         console.error(`CameraImageProvider: API Initialization Failed - ${message}`, errorObj || '');
         this.activeApiName = null;
         this.captureHelper = null;
-        // TODO: Consider emitting an event that the CV system can listen to for failure.
-        // Example: this.aframeCameraEl.emit('camera-provider-failed', { message }, false);
     }
 
     registerProcessor(processor) {
@@ -198,7 +184,7 @@ export default class CameraImageProvider {
         }
         this.processors.add(processor);
 
-        if (this.captureHelper) { // A helper is initialized
+        if (this.captureHelper) { 
             if (!this.isCapturing && this.processors.size > 0) {
                 if (this.options.debug) {
                     console.log(
@@ -241,24 +227,27 @@ export default class CameraImageProvider {
             );
         }
 
-        // Call helper's startStreaming method, which is part of BaseCaptureHelper
-        if (typeof this.captureHelper.startStreaming === 'function') {
-            this.captureHelper.startStreaming();
-        }
-
-
-        if (this.captureHelper.usesXRFrame) {
+        if (this.captureHelper && this.captureHelper.usesXRFrame) {
             if (this.xrSession) {
                 this.xrSession.requestAnimationFrame(this._onXRFrame);
             } else {
                 console.error(
                     `CameraImageProvider: XR session not available for API '${this.activeApiName}'. Cannot start XR frame loop.`
                 );
-                this.isCapturing = false;
-                if (typeof this.captureHelper.stopStreaming === 'function') this.captureHelper.stopStreaming();
+                this.isCapturing = false; 
             }
-        } else { // GUM or other non-XRFrame based helpers
-            window.requestAnimationFrame(this._onGUMFrame);
+        } else if (this.captureHelper && !this.captureHelper.usesXRFrame) {
+            if (typeof this.captureHelper.startStreaming === 'function') {
+                this.captureHelper.startStreaming(); 
+            } else {
+                console.warn(
+                    `CameraImageProvider: Active helper ${this.activeApiName} is non-XRFrame but has no startStreaming method.`
+                );
+                this.isCapturing = false; 
+            }
+        } else { 
+            console.warn('CameraImageProvider: No active or valid capture helper to start capture loop for.');
+            this.isCapturing = false; 
         }
     }
 
@@ -276,82 +265,76 @@ export default class CameraImageProvider {
             if (this.isCapturing && this.options.debug) {
                 console.warn('CameraImageProvider: _onXRFrame called but conditions not met or helper changed.');
             }
-            this.isCapturing = false; // Stop if state is inconsistent
+            this.isCapturing = false; 
             return;
         }
         this.xrSession.requestAnimationFrame(this._onXRFrame);
 
         if (this.processors.size === 0 || this.isPipelineBusy) {
-            // if (this.isPipelineBusy && this.options.debug) console.log('CameraImageProvider: Pipeline busy, XR frame dropped.');
             return;
         }
         
         let acquiredFrameData = null;
-        // Moved pose acquisition inside try block as it's part of frame processing
         try {
-            if (!this.xrRefSpace) {
-                console.warn('CameraImageProvider: xrRefSpace not available for XR frame.');
-                return;
-            }
-            const pose = frame.getViewerPose(this.xrRefSpace);
-            if (!pose) {
-                if (this.options.debug) console.warn('CameraImageProvider: No viewer pose for XR frame.');
-                return;
-            }
-            acquiredFrameData = await this.captureHelper.getFrameData(time, frame, pose);
+            acquiredFrameData = await this.captureHelper.getFrameData(time, frame);
         } catch (error) {
             console.error(`CameraImageProvider: Error in getFrameData for ${this.activeApiName}:`, error);
             return; 
         }
 
-
         if (acquiredFrameData) {
+            this.isPipelineBusy = true; // Set busy before distributing
             this._distributeFrameToProcessors(acquiredFrameData.imageData, acquiredFrameData.metadata);
         } else if (this.options.debug) {
             // console.log('CameraImageProvider: No data acquired from helper in _onXRFrame.');
         }
     }
+    
+    /**
+     * Called by capture helpers that manage their own frame loops (e.g., GetUserMedia, WebARViewer)
+     * to push frame data into the processing pipeline.
+     * @param {FrameData} frameData - The frame data object containing imageData and metadata.
+     */
+    distributeFrameData(frameData) {
+        if (!this.isCapturing) { // If provider was stopped, ignore incoming frames
+            return;
+        }
 
-    async _onGUMFrame(time) {
-        if (!this.isCapturing || !this.captureHelper || this.captureHelper.usesXRFrame) {
-             if (this.isCapturing && this.options.debug) {
-                console.warn('CameraImageProvider: _onGUMFrame called but conditions not met or helper changed.');
+        if (this.processors.size === 0) {
+            // No processors registered, nothing to do.
+            return;
+        }
+
+        if (this.isPipelineBusy) {
+            if (this.options.debug) {
+                console.log('CameraImageProvider: Pipeline busy, frame dropped from external helper.');
             }
-            this.isCapturing = false; // Stop if state is inconsistent
-            return;
-        }
-        window.requestAnimationFrame(this._onGUMFrame);
-
-        if (this.processors.size === 0 || this.isPipelineBusy) {
-            // if (this.isPipelineBusy && this.options.debug) console.log('CameraImageProvider: Pipeline busy, GUM frame dropped.');
             return;
         }
 
-        let acquiredFrameData = null;
-        try {
-            acquiredFrameData = await this.captureHelper.getFrameData(time);
-        } catch (error) {
-            console.error(
-                `CameraImageProvider: Error in GUM getFrameData for ${this.activeApiName}:`,
-                error
-            );
+        if (!frameData || !frameData.imageData || !frameData.metadata) {
+            if (this.options.debug) {
+                console.warn('CameraImageProvider: Invalid frameData received in distributeFrameData.');
+            }
             return;
         }
 
-        if (acquiredFrameData) {
-            this._distributeFrameToProcessors(acquiredFrameData.imageData, acquiredFrameData.metadata);
-        } else if (this.options.debug) {
-            // console.log('CameraImageProvider: No data acquired from helper in _onGUMFrame.');
-        }
+        this.isPipelineBusy = true; // Set busy flag before starting processing
+        this._distributeFrameToProcessors(frameData.imageData, frameData.metadata);
     }
+
 
     _distributeFrameToProcessors(imageData, metadata) {
         if (!imageData || !metadata) {
             if (this.options.debug) console.warn('CameraImageProvider: No image data or metadata to distribute.');
+            // Ensure pipeline busy is reset if we bail early here due to bad data
+            // This should ideally not happen if checks are done before calling this.
+            this.isPipelineBusy = false; 
             return;
         }
 
-        this.isPipelineBusy = true;
+        // this.isPipelineBusy = true; // Removed from here
+
         const processingPromises = [];
         for (const processor of this.processors) {
             processingPromises.push(
@@ -382,7 +365,6 @@ export default class CameraImageProvider {
         this.captureHelper = null;
         this.activeApiName = null;
         this.xrSession = null;
-        // this.gl = null; // GL context is typically owned by A-Frame renderer
         this.xrRefSpace = null;
         this.aframeCameraEl = null;
         this.isPipelineBusy = false;

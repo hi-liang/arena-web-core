@@ -22,10 +22,11 @@ import BaseCaptureHelper from './base-capture-helper.js';
 const THREE = AFRAME.THREE; // Access THREE.js via AFRAME
 
 export default class GetUserMediaCaptureHelper extends BaseCaptureHelper {
-    constructor(aframeCameraEl = null, options = {}) {
+    constructor(aframeCameraEl = null, options = {}, providerInterface = null) {
         super(null, null, aframeCameraEl, options);
 
         this.aframeCameraEl = aframeCameraEl; 
+        this.providerInterface = providerInterface; // Store the provider interface
 
         const defaultOptions = {
             debug: false,
@@ -44,11 +45,14 @@ export default class GetUserMediaCaptureHelper extends BaseCaptureHelper {
         this.frameWidth = 0;
         this.frameHeight = 0;
         this.currentFacingMode = null; 
+        this.videoFrameCallbackHandle = null; // To track if rVFC loop is active
 
         // Reusable THREE.Matrix4 instances
         this.reusableWorldPose = new THREE.Matrix4();
         this.reusableViewTransformMatrix = new THREE.Matrix4();
-        // Note: projectionMatrix is handled as Float32Array, so no reusable THREE.Matrix4 for it here.
+        this.reusableProjectionMatrix = new THREE.Matrix4(); // For copying projection matrix
+
+        this._onVideoFrame = this._onVideoFrame.bind(this); // Bind the new callback method
 
         if (this.options.debug) {
             console.log('GetUserMediaCaptureHelper: Constructor options:', this.options);
@@ -56,7 +60,9 @@ export default class GetUserMediaCaptureHelper extends BaseCaptureHelper {
     }
 
     static isSupported() {
-        return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+        // Also check for requestVideoFrameCallback support
+        return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && 
+                  HTMLVideoElement && typeof HTMLVideoElement.prototype.requestVideoFrameCallback === 'function');
     }
 
     async init() {
@@ -66,7 +72,7 @@ export default class GetUserMediaCaptureHelper extends BaseCaptureHelper {
         }
 
         if (!GetUserMediaCaptureHelper.isSupported()) {
-            console.error('GetUserMediaCaptureHelper: getUserMedia API not supported.');
+            console.error('GetUserMediaCaptureHelper: getUserMedia API or requestVideoFrameCallback not supported.');
             return false;
         }
         if (!this.aframeCameraEl && this.options.debug) { 
@@ -136,7 +142,7 @@ export default class GetUserMediaCaptureHelper extends BaseCaptureHelper {
             this.canvasElement.height = this.frameHeight;
             this.canvasContext = this.canvasElement.getContext('2d', { willReadFrequently: true });
             this.framePixels = new Uint8ClampedArray(this.frameWidth * this.frameHeight * 4);
-            this.isCapturing = true; 
+            this.isCapturing = true; // Mark as initialized and ready
 
             if (this.options.debug) {
                 console.log(`GetUserMediaCaptureHelper: Init successful. Stream dimensions: ${this.frameWidth}x${this.frameHeight}`);
@@ -150,50 +156,67 @@ export default class GetUserMediaCaptureHelper extends BaseCaptureHelper {
         }
     }
 
-    async getFrameData(time) { 
-        if (!this.isCapturing || !super.isStreaming || !this.videoElement ||
+    async _onVideoFrame(now, videoFrameMetadata) {
+        // isStreaming is used from BaseCaptureHelper to control the loop
+        if (!this.isCapturing || !super.isStreaming || !this.videoElement || 
             this.videoElement.readyState < this.videoElement.HAVE_METADATA || 
             this.videoElement.paused || this.videoElement.ended) {
-            return null;
-        }
-
-        if (!this.aframeCameraEl || !this.aframeCameraEl.object3D) {
-             if (this.options.debug) console.warn('GetUserMediaCaptureHelper: aframeCameraEl not available for pose data.');
+            
+            // If still supposed to be capturing and streaming, but video ended/paused unexpectedly, try to restart rVFC
+            // However, if !super.isStreaming, it means stopStreaming() was called, so we should not request another frame.
+            if (this.isCapturing && super.isStreaming && this.videoElement && 
+                typeof this.videoElement.requestVideoFrameCallback === 'function') {
+                try {
+                    this.videoElement.requestVideoFrameCallback(this._onVideoFrame);
+                } catch (e) {
+                    console.error("GetUserMediaCaptureHelper: Error requesting video frame callback in _onVideoFrame check:", e);
+                }
+            }
+            return;
         }
 
         try {
             this.canvasContext.drawImage(this.videoElement, 0, 0, this.frameWidth, this.frameHeight);
             const imageDataFromCanvas = this.canvasContext.getImageData(0, 0, this.frameWidth, this.frameHeight);
-            this.framePixels.set(imageDataFromCanvas.data);
+            
+            if (this.framePixels && this.framePixels.length === imageDataFromCanvas.data.length) {
+                this.framePixels.set(imageDataFromCanvas.data);
+            } else {
+                this.framePixels = new Uint8ClampedArray(imageDataFromCanvas.data); // Re-initialize if needed
+            }
         } catch (error) {
             console.error('GetUserMediaCaptureHelper: Error drawing or getting image data:', error);
-            return null;
+            // Request next frame even on error to keep the loop attempting
+            if (this.isCapturing && super.isStreaming && this.videoElement && typeof this.videoElement.requestVideoFrameCallback === 'function') {
+                 try { this.videoElement.requestVideoFrameCallback(this._onVideoFrame); } catch(e) { /* ignore */ }
+            }
+            return;
         }
 
-        // Use reusable matrices
-        const aframeCameraProjectionMatrixElements = new Float32Array(16); // For projection matrix
+        const timestamp = videoFrameMetadata.captureTime || videoFrameMetadata.presentedFrames || now; // Use presentedFrames as a fallback for mediaTime
 
-        if (this.aframeCameraEl && this.aframeCameraEl.object3D && this.aframeCameraEl.object3D.matrixWorld) {
+        const aframeCameraProjectionMatrixElements = new Float32Array(16); 
+
+        if (this.aframeCameraEl && this.aframeCameraEl.object3D) {
             this.reusableWorldPose.copy(this.aframeCameraEl.object3D.matrixWorld);
             if (this.aframeCameraEl.components.camera) { 
                  this.aframeCameraEl.components.camera.updateProjectionMatrix(); 
-                 // Copy elements to Float32Array, as projectionMatrix in metadata is defined as such
                  aframeCameraProjectionMatrixElements.set(this.aframeCameraEl.components.camera.projectionMatrix.elements);
             } else {
                 if(this.options.debug) console.warn('GetUserMediaCaptureHelper: A-Frame camera component not found on aframeCameraEl.');
-                 new THREE.Matrix4().identity().toArray(aframeCameraProjectionMatrixElements); // Identity if no camera component
+                 this.reusableProjectionMatrix.identity().toArray(aframeCameraProjectionMatrixElements);
             }
             this.reusableViewTransformMatrix.copy(this.reusableWorldPose).invert();
         } else {
              if (this.options.debug) console.warn('GetUserMediaCaptureHelper: aframeCameraEl.object3D not available for matrix data.');
              this.reusableWorldPose.identity();
+             this.reusableProjectionMatrix.identity().toArray(aframeCameraProjectionMatrixElements);
              this.reusableViewTransformMatrix.identity();
-             new THREE.Matrix4().identity().toArray(aframeCameraProjectionMatrixElements); // Identity projection
         }
 
         const cameraIntrinsics = null; 
 
-        return {
+        const frameData = {
             imageData: {
                 buffer: this.framePixels, 
                 width: this.frameWidth,
@@ -203,7 +226,7 @@ export default class GetUserMediaCaptureHelper extends BaseCaptureHelper {
                 canvas: this.canvasElement 
             },
             metadata: {
-                timestamp: time,
+                timestamp: timestamp,
                 worldPose: this.reusableWorldPose, 
                 cameraIntrinsics, 
                 projectionMatrix: aframeCameraProjectionMatrixElements, 
@@ -211,29 +234,75 @@ export default class GetUserMediaCaptureHelper extends BaseCaptureHelper {
                 facingMode: this.currentFacingMode,
             },
         };
+
+        if (this.providerInterface && typeof this.providerInterface.distributeFrameData === 'function') {
+            this.providerInterface.distributeFrameData(frameData);
+        } else if (this.options.debug) { // Only log warning if debug is enabled
+            console.warn('GetUserMediaCaptureHelper: providerInterface.distributeFrameData is not available.');
+        }
+
+        if (this.isCapturing && super.isStreaming && this.videoElement && typeof this.videoElement.requestVideoFrameCallback === 'function') {
+            try {
+                this.videoElement.requestVideoFrameCallback(this._onVideoFrame);
+            } catch (e) {
+                console.error("GetUserMediaCaptureHelper: Error requesting video frame callback at end of _onVideoFrame:", e);
+            }
+        }
     }
 
     startStreaming() { 
-        super.startStreaming(); 
-        if (this.videoElement && this.videoElement.paused) {
-            this.videoElement.play().catch(error => {
-                console.error('GetUserMediaCaptureHelper: Error trying to play video in startStreaming:', error);
-            });
+        super.startStreaming(); // Sets this.isStreaming = true
+        if (this.isCapturing && this.videoElement && typeof this.videoElement.requestVideoFrameCallback === 'function') {
+            if (this.videoElement.paused) { // Ensure video is playing
+                this.videoElement.play().then(() => {
+                    // Start rVFC loop only after play promise resolves
+                    if (!this.videoFrameCallbackHandle) { // Check if loop isn't already considered active
+                         try {
+                            this.videoElement.requestVideoFrameCallback(this._onVideoFrame);
+                            this.videoFrameCallbackHandle = true; // Indicate loop has been started
+                            if (this.options.debug) console.log('GetUserMediaCaptureHelper: Started requestVideoFrameCallback loop after play.');
+                         } catch(e) {
+                            console.error("GetUserMediaCaptureHelper: Error starting requestVideoFrameCallback loop after play:", e);
+                         }
+                    }
+                }).catch(error => {
+                    console.error('GetUserMediaCaptureHelper: Error trying to play video in startStreaming:', error);
+                });
+            } else if (!this.videoFrameCallbackHandle) { // Video is already playing
+                 try {
+                    this.videoElement.requestVideoFrameCallback(this._onVideoFrame);
+                    this.videoFrameCallbackHandle = true; // Indicate loop has been started
+                    if (this.options.debug) console.log('GetUserMediaCaptureHelper: Started requestVideoFrameCallback loop.');
+                 } catch(e) {
+                    console.error("GetUserMediaCaptureHelper: Error starting requestVideoFrameCallback loop:", e);
+                 }
+            }
+        } else if (this.options.debug) {
+            console.warn('GetUserMediaCaptureHelper: Could not start rVFC loop. Conditions not met:', 
+                         `isCapturing=${this.isCapturing}`, 
+                         `videoElement=${!!this.videoElement}`,
+                         `rVFC supported=${typeof this.videoElement?.requestVideoFrameCallback === 'function'}`);
         }
-        if (this.options.debug) console.log('GetUserMediaCaptureHelper: Streaming started.');
     }
 
     stopStreaming() { 
-        super.stopStreaming(); 
+        super.stopStreaming(); // Sets this.isStreaming = false
+        // The isStreaming flag will cause _onVideoFrame to stop queueing new callbacks.
+        // No specific handle to cancel rVFC, the loop self-terminates based on isStreaming.
+        this.videoFrameCallbackHandle = false; // Reset the flag indicating loop is active
+
         if (this.videoElement && !this.videoElement.paused) {
             this.videoElement.pause();
         }
-        if (this.options.debug) console.log('GetUserMediaCaptureHelper: Streaming stopped (video paused).');
+        if (this.options.debug) console.log('GetUserMediaCaptureHelper: Stopped requestVideoFrameCallback loop (video paused).');
     }
+
+    // Old getFrameData is removed.
 
     destroy() {
         if (this.options.debug) console.log('GetUserMediaCaptureHelper: Destroying...');
-        super.stopStreaming(); 
+        // isCapturing is set to false by super.destroy()
+        // isStreaming is set to false by super.stopStreaming() which is called by super.destroy()
 
         if (this.videoStream) { 
             this.videoStream.getTracks().forEach(track => track.stop());
@@ -248,6 +317,7 @@ export default class GetUserMediaCaptureHelper extends BaseCaptureHelper {
             }
         }
         this.videoElement = null;
+        this.videoFrameCallbackHandle = false; // Ensure flag is reset
         
         this.canvasElement = null;
         this.canvasContext = null;
@@ -259,4 +329,4 @@ export default class GetUserMediaCaptureHelper extends BaseCaptureHelper {
 }
 
 GetUserMediaCaptureHelper.prototype.usesXRFrame = false;
-// GetUserMediaCaptureHelper.isSupported = GetUserMediaCaptureHelper.isSupported; // Not needed static inherited.
+// GetUserMediaCaptureHelper.isSupported = GetUserMediaCaptureHelper.isSupported; // Static methods are inherited.
